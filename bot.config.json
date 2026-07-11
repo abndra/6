@@ -1,0 +1,21 @@
+{
+  "botName": "Taysir WhatsApp",
+  "railwayServerName": "taysir-whatsapp-server",
+  "endpoints": [
+    "GET /status",
+    "POST /send",
+    "POST /restart",
+    "POST /logout",
+    "POST /reset-session"
+  ],
+  "requiredVariables": [
+    "SERVICE_TOKEN"
+  ],
+  "optionalVariables": [
+    "GROQ_API_KEY",
+    "BOT_NAME",
+    "SYSTEM_PROMPT",
+    "GROQ_MODEL"
+  ],
+  "prompt": "أنت وكيل واتساب ذكي من تيسير. أجب بالعربية بوضوح، لا تخترع معلومات غير موجودة، وحوّل للمالك عند الحاجة."
+}
