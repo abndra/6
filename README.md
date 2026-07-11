@@ -1,4 +1,4 @@
-# Taysir WhatsApp
+# 6
 
 ملفات سيرفر واتساب الجاهزة للرفع على GitHub ثم Railway.
 
@@ -9,7 +9,7 @@
 ```env
 SERVICE_TOKEN=نفس التوكن الذي تحفظه في لوحة تيسير
 GROQ_API_KEY=اختياري إذا تريد ردود AI
-BOT_NAME=Taysir WhatsApp
+BOT_NAME=6
 SYSTEM_PROMPT=أنت وكيل واتساب ذكي من تيسير. أجب بالعربية بوضوح، لا تخترع معلومات غير موجودة، وحوّل للمالك عند الحاجة.
 GROQ_MODEL=llama-3.3-70b-versatile
 ```

@@ -1,5 +1,7 @@
 {
-  "botName": "Taysir WhatsApp",
+  "botName": "6",
+  "storeId": "zj4KW4k2kiInawdlofxD",
+  "botId": "6fZIB8yfDE2QCzn21JKM",
   "railwayServerName": "taysir-whatsapp-server",
   "endpoints": [
     "GET /status",
@@ -9,13 +11,17 @@
     "POST /reset-session"
   ],
   "requiredVariables": [
-    "SERVICE_TOKEN"
+    "SERVICE_TOKEN",
+    "GROQ_API_KEY",
+    "FIREBASE_SERVICE_ACCOUNT",
+    "TAYSIR_STORE_ID",
+    "TAYSIR_BOT_ID"
   ],
   "optionalVariables": [
-    "GROQ_API_KEY",
     "BOT_NAME",
     "SYSTEM_PROMPT",
-    "GROQ_MODEL"
+    "GROQ_MODEL",
+    "SYNC_FULL_HISTORY"
   ],
   "prompt": "أنت وكيل واتساب ذكي من تيسير. أجب بالعربية بوضوح، لا تخترع معلومات غير موجودة، وحوّل للمالك عند الحاجة."
 }

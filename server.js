@@ -6,6 +6,7 @@ import P from 'pino';
 import fs from 'fs/promises';
 import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
+import { upsertCustomer, saveMessage, logEvent, incrBotCounter, FIRE_READY } from './firestore.js';
 
 const app = express();
 app.use(cors({ origin: true }));
@@ -13,11 +14,12 @@ app.use(express.json({ limit: '2mb' }));
 
 const PORT = process.env.PORT || 3000;
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN || '';
-const BOT_NAME = process.env.BOT_NAME || "Taysir WhatsApp";
+const BOT_NAME = process.env.BOT_NAME || "6";
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "أنت وكيل واتساب ذكي من تيسير. أجب بالعربية بوضوح، لا تخترع معلومات غير موجودة، وحوّل للمالك عند الحاجة.";
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 const AUTH_DIR = process.env.AUTH_DIR || './auth';
+const SYNC_HISTORY = String(process.env.SYNC_FULL_HISTORY || 'true') === 'true';
 
 let sock = null;
 let qrDataUrl = null;
@@ -43,6 +45,37 @@ function extractText(message) {
     || message?.imageMessage?.caption
     || message?.videoMessage?.caption
     || '';
+}
+
+function messageType(m) {
+  if (!m?.message) return 'unknown';
+  const k = Object.keys(m.message)[0] || 'unknown';
+  return k.replace('Message', '').toLowerCase();
+}
+
+async function persistMessage(msg, extra = {}) {
+  if (!FIRE_READY || !msg?.key) return;
+  const jid = msg.key.remoteJid;
+  if (!jid || jid === 'status@broadcast') return;
+  const phone = String(jid).replace(/@.*/, '');
+  const text = extractText(msg.message) || '';
+  const type = messageType(msg);
+  const ts = msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now();
+  try {
+    await upsertCustomer({ jid, name: msg.pushName || phone, lastMessage: text || '[' + type + ']', lastSeenAt: ts });
+    await saveMessage({
+      conversationId: phone,
+      messageId: msg.key.id,
+      from: jid,
+      fromMe: !!msg.key.fromMe,
+      body: text,
+      type,
+      timestamp: ts,
+      raw: msg.message ? JSON.parse(JSON.stringify(msg.message)) : null,
+      ...extra,
+    });
+    await incrBotCounter(1);
+  } catch (e) { console.error('persist failed', e?.message); }
 }
 
 async function askGroq(text) {
@@ -93,7 +126,7 @@ async function startWhatsApp(options = {}) {
       logger: P({ level: 'silent' }),
       printQRInTerminal: false,
       browser: ['Taysir WhatsApp', 'Chrome', '1.0.0'],
-      syncFullHistory: false
+      syncFullHistory: SYNC_HISTORY
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -126,19 +159,30 @@ async function startWhatsApp(options = {}) {
       }
     });
 
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-      const msg = messages?.[0];
-      if (!msg || msg.key.fromMe) return;
-      const from = msg.key.remoteJid;
-      const text = extractText(msg.message);
-      if (!from || !text.trim()) return;
+    sock.ev.on('messaging-history.set', async ({ messages, contacts }) => {
       try {
-        const reply = await askGroq(text);
-        await sock.sendMessage(from, { text: reply });
-        messagesCount += 1;
-      } catch (err) {
-        console.error('reply failed', err);
-        await sock.sendMessage(from, { text: 'حدث خطأ مؤقت، حاول مرة أخرى.' }).catch(() => {});
+        for (const m of (messages || [])) await persistMessage(m);
+        for (const c of (contacts || [])) if (c?.id) await upsertCustomer({ jid: c.id, name: c.name || c.notify || '' }).catch(() => {});
+        await logEvent('history_synced', { messages: messages?.length || 0 });
+      } catch (e) { console.error('history.set failed', e); }
+    });
+
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+      for (const msg of (messages || [])) {
+        await persistMessage(msg);
+        if (!msg || msg.key?.fromMe) continue;
+        const from = msg.key?.remoteJid;
+        const text = extractText(msg.message);
+        if (!from || !text.trim()) continue;
+        try {
+          const reply = await askGroq(text);
+          const sent = await sock.sendMessage(from, { text: reply });
+          messagesCount += 1;
+          if (sent) await persistMessage(sent, { aiHandled: true, aiModel: GROQ_MODEL });
+        } catch (err) {
+          console.error('reply failed', err);
+          await sock.sendMessage(from, { text: 'حدث خطأ مؤقت، حاول مرة أخرى.' }).catch(() => {});
+        }
       }
     });
   } catch (err) {
