@@ -100,11 +100,20 @@ async function persistMessage(msg, extra = {}) {
 async function askGroq(text) {
   const cfg = await ensureConfig();
   const kb = Array.isArray(cfg.knowledge) ? cfg.knowledge : [];
+  const faqs = Array.isArray(cfg.faqs) ? cfg.faqs : [];
+  const quick = Array.isArray(cfg.quickReplies) ? cfg.quickReplies : [];
   const kbText = kb.map(k => '- ' + (k.title || '') + ': ' + (k.content || '')).join('\n');
-  const sys = (cfg.systemPrompt || SYSTEM_PROMPT) + (kbText ? '\n\nقاعدة معرفة المتجر (استخدمها كمصدر للحقيقة):\n' + kbText : '');
-  if (!GROQ_API_KEY) {
-    return cfg.fallbackMessage || cfg.welcomeMessage || 'تم استلام رسالتك، وسنرد عليك قريباً.';
-  }
+  const faqText = faqs.map(f => 'س: ' + (f.q || '') + '\nج: ' + (f.a || '')).join('\n');
+  const qrText = quick.map(q => '- إذا ذكر «' + (q.trigger || '') + '» فمن المناسب أن يتضمن الرد: ' + (q.reply || '')).join('\n');
+  const persona = cfg.persona ? ('شخصيتك: ' + cfg.persona + '\n\n') : '';
+  const base = cfg.systemPrompt || SYSTEM_PROMPT;
+  const guardrails = '\n\nقواعد الرد:\n- حلّل رسالة العميل وافهم قصده حتى لو كتبها بأسلوب مختلف أو بأخطاء إملائية.\n- استخدم قاعدة المعرفة والأسئلة الشائعة كمصدر للحقيقة، وأعد الصياغة بأسلوبك بلغة العميل (عربية فصحى/عامية حسب رسالته).\n- إذا لم تجد إجابة دقيقة، اطرح سؤالاً توضيحياً قصيراً بدل الاعتذار الجاف. لا تكرر نفس الرد حرفياً.\n- اجعل الرد قصيراً (سطر إلى ثلاثة أسطر) وبصيغة ودّية طبيعية.';
+  const sys = persona + base
+    + (kbText ? '\n\nقاعدة معرفة المتجر:\n' + kbText : '')
+    + (faqText ? '\n\nأسئلة شائعة (استفد منها كمرجع):\n' + faqText : '')
+    + (qrText ? '\n\nتلميحات ردود سريعة:\n' + qrText : '')
+    + guardrails;
+  if (!GROQ_API_KEY) throw new Error('GROQ_API_KEY missing');
   const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -113,7 +122,7 @@ async function askGroq(text) {
     },
     body: JSON.stringify({
       model: GROQ_MODEL,
-      temperature: 0.6,
+      temperature: 0.7,
       messages: [
         { role: 'system', content: sys },
         { role: 'user', content: text }
@@ -122,7 +131,9 @@ async function askGroq(text) {
   });
   if (!response.ok) throw new Error('Groq failed: ' + response.status);
   const data = await response.json();
-  return data?.choices?.[0]?.message?.content || (cfg.fallbackMessage || 'لم أفهم رسالتك، هل يمكنك توضيح المطلوب؟');
+  const out = data?.choices?.[0]?.message?.content;
+  if (!out) throw new Error('Groq empty response');
+  return out;
 }
 
 function normalizeAr(s) {
@@ -134,32 +145,25 @@ function normalizeAr(s) {
 
 async function generateReply(text, from) {
   const cfg = await ensureConfig();
-  const norm = normalizeAr(text);
-
   // 0) Store closed
   if (cfg.isOpen === false) {
     return cfg.closedMessage || 'المتجر مغلق حالياً، سنعود إليك عند الفتح.';
   }
-  // 1) Quick replies — trigger match
-  const quick = Array.isArray(cfg.quickReplies) ? cfg.quickReplies : [];
-  for (const q of quick) {
-    const trg = normalizeAr(q?.trigger);
-    if (trg && norm.includes(trg)) return q.reply || '';
-  }
-  // 2) FAQ match
-  const faqs = Array.isArray(cfg.faqs) ? cfg.faqs : [];
-  for (const f of faqs) {
-    const q = normalizeAr(f?.q);
-    if (q && (norm.includes(q) || q.includes(norm))) return f.a || '';
-  }
-  // 3) Welcome message on first contact
+  // 1) Welcome message on first contact (يُرسل قبل رد الذكاء الاصطناعي)
   const welcome = cfg.welcomeMessage || cfg.greeting;
+  let prefix = '';
   if (from && !greetedJids.has(from) && welcome) {
     greetedJids.add(from);
-    return welcome;
+    prefix = welcome + '\n\n';
   }
-  // 4) AI (Groq) with knowledge base injected — or fallback
-  return askGroq(text);
+  // 2) دائماً استخدم الذكاء الاصطناعي (Groq) لفهم الرسالة والرد الذكي
+  try {
+    const ai = await askGroq(text);
+    return (prefix + ai).trim();
+  } catch (e) {
+    console.error('Groq generateReply failed:', e?.message);
+    return (prefix + (cfg.fallbackMessage || 'حصل خلل مؤقت في الذكاء الاصطناعي، سنعاود الرد قريباً.')).trim();
+  }
 }
 
 async function clearSession() {
