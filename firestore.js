@@ -39,3 +39,9 @@ export async function saveMessage({ conversationId, messageId, from, fromMe, bod
 }
 export async function logEvent(type, payload = {}) { if (!FIRE_READY) return; await botRef().collection('events').add({ type, payload, at: now() }); }
 export async function incrBotCounter(n = 1) { if (!FIRE_READY) return; await botRef().set({ messagesCount: inc(n), lastMessageAt: now() }, { merge: true }); }
+export async function getBotConfig() {
+  if (!FIRE_READY) return null;
+  const snap = await botRef().get();
+  if (!snap.exists) return null;
+  return snap.data();
+}

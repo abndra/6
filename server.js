@@ -6,7 +6,7 @@ import P from 'pino';
 import fs from 'fs/promises';
 import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
-import { upsertCustomer, saveMessage, logEvent, incrBotCounter, FIRE_READY } from './firestore.js';
+import { upsertCustomer, saveMessage, logEvent, incrBotCounter, getBotConfig, FIRE_READY } from './firestore.js';
 
 const app = express();
 app.use(cors({ origin: true }));
@@ -20,6 +20,22 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 const AUTH_DIR = process.env.AUTH_DIR || './auth';
 const SYNC_HISTORY = String(process.env.SYNC_FULL_HISTORY || 'true') === 'true';
+
+// Cache of dynamic bot config (knowledge base, welcome message, quick replies, faqs, features)
+let cfgCache = null;
+let cfgFetchedAt = 0;
+const CFG_TTL_MS = 30_000;
+const greetedJids = new Set();
+
+async function ensureConfig() {
+  const now = Date.now();
+  if (cfgCache && (now - cfgFetchedAt) < CFG_TTL_MS) return cfgCache;
+  try {
+    const c = await getBotConfig();
+    if (c) { cfgCache = c; cfgFetchedAt = now; }
+  } catch (e) { console.error('config load failed', e?.message); }
+  return cfgCache || {};
+}
 
 let sock = null;
 let qrDataUrl = null;
@@ -57,7 +73,10 @@ async function persistMessage(msg, extra = {}) {
   if (!FIRE_READY || !msg?.key) return;
   const jid = msg.key.remoteJid;
   if (!jid || jid === 'status@broadcast') return;
+  // تجاهل المجموعات، البث، @lid — نحفظ فقط أرقام واتساب الحقيقية
+  if (!/@s.whatsapp.net$/.test(jid)) return;
   const phone = String(jid).replace(/@.*/, '');
+  if (!/^d{8,15}$/.test(phone)) return;
   const text = extractText(msg.message) || '';
   const type = messageType(msg);
   const ts = msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now();
@@ -79,7 +98,13 @@ async function persistMessage(msg, extra = {}) {
 }
 
 async function askGroq(text) {
-  if (!GROQ_API_KEY) return 'تم استلام رسالتك، وسنرد عليك قريباً.';
+  const cfg = await ensureConfig();
+  const kb = Array.isArray(cfg.knowledge) ? cfg.knowledge : [];
+  const kbText = kb.map(k => '- ' + (k.title || '') + ': ' + (k.content || '')).join('\n');
+  const sys = (cfg.systemPrompt || SYSTEM_PROMPT) + (kbText ? '\n\nقاعدة معرفة المتجر (استخدمها كمصدر للحقيقة):\n' + kbText : '');
+  if (!GROQ_API_KEY) {
+    return cfg.fallbackMessage || cfg.welcomeMessage || 'تم استلام رسالتك، وسنرد عليك قريباً.';
+  }
   const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -90,14 +115,51 @@ async function askGroq(text) {
       model: GROQ_MODEL,
       temperature: 0.6,
       messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'system', content: sys },
         { role: 'user', content: text }
       ]
     })
   });
   if (!response.ok) throw new Error('Groq failed: ' + response.status);
   const data = await response.json();
-  return data?.choices?.[0]?.message?.content || 'لم أفهم رسالتك، هل يمكنك توضيح المطلوب؟';
+  return data?.choices?.[0]?.message?.content || (cfg.fallbackMessage || 'لم أفهم رسالتك، هل يمكنك توضيح المطلوب؟');
+}
+
+function normalizeAr(s) {
+  return String(s || '').trim().toLowerCase()
+    .replace(/[\u064B-\u065F\u0670]/g, '')
+    .replace(/[إأآا]/g, 'ا').replace(/ى/g, 'ي').replace(/ة/g, 'ه')
+    .replace(/\s+/g, ' ');
+}
+
+async function generateReply(text, from) {
+  const cfg = await ensureConfig();
+  const norm = normalizeAr(text);
+
+  // 0) Store closed
+  if (cfg.isOpen === false) {
+    return cfg.closedMessage || 'المتجر مغلق حالياً، سنعود إليك عند الفتح.';
+  }
+  // 1) Quick replies — trigger match
+  const quick = Array.isArray(cfg.quickReplies) ? cfg.quickReplies : [];
+  for (const q of quick) {
+    const trg = normalizeAr(q?.trigger);
+    if (trg && norm.includes(trg)) return q.reply || '';
+  }
+  // 2) FAQ match
+  const faqs = Array.isArray(cfg.faqs) ? cfg.faqs : [];
+  for (const f of faqs) {
+    const q = normalizeAr(f?.q);
+    if (q && (norm.includes(q) || q.includes(norm))) return f.a || '';
+  }
+  // 3) Welcome message on first contact
+  const welcome = cfg.welcomeMessage || cfg.greeting;
+  if (from && !greetedJids.has(from) && welcome) {
+    greetedJids.add(from);
+    return welcome;
+  }
+  // 4) AI (Groq) with knowledge base injected — or fallback
+  return askGroq(text);
 }
 
 async function clearSession() {
@@ -175,7 +237,8 @@ async function startWhatsApp(options = {}) {
         const text = extractText(msg.message);
         if (!from || !text.trim()) continue;
         try {
-          const reply = await askGroq(text);
+          const reply = await generateReply(text, from);
+          if (!reply) continue;
           const sent = await sock.sendMessage(from, { text: reply });
           messagesCount += 1;
           if (sent) await persistMessage(sent, { aiHandled: true, aiModel: GROQ_MODEL });
