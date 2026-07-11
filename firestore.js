@@ -41,7 +41,12 @@ export async function logEvent(type, payload = {}) { if (!FIRE_READY) return; aw
 export async function incrBotCounter(n = 1) { if (!FIRE_READY) return; await botRef().set({ messagesCount: inc(n), lastMessageAt: now() }, { merge: true }); }
 export async function getBotConfig() {
   if (!FIRE_READY) return null;
-  const snap = await botRef().get();
-  if (!snap.exists) return null;
-  return snap.data();
+  const storeRef = db.collection('stores').doc(STORE_ID);
+  const [botSnap, secretSnap] = await Promise.all([
+    botRef().get(),
+    storeRef.collection('botSecrets').doc(BOT_ID).get().catch(() => null),
+  ]);
+  const botData = botSnap.exists ? botSnap.data() : {};
+  const secretData = secretSnap && secretSnap.exists ? secretSnap.data() : {};
+  return { ...botData, ...secretData };
 }

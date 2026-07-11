@@ -16,7 +16,7 @@ const PORT = process.env.PORT || 3000;
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN || '';
 const BOT_NAME = process.env.BOT_NAME || "6";
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "أنت وكيل واتساب ذكي من تيسير. أجب بالعربية بوضوح، لا تخترع معلومات غير موجودة، وحوّل للمالك عند الحاجة.";
-const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+const DEFAULT_GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 const AUTH_DIR = process.env.AUTH_DIR || './auth';
 const SYNC_HISTORY = String(process.env.SYNC_FULL_HISTORY || 'true') === 'true';
@@ -44,6 +44,7 @@ let state = 'starting';
 let connected = false;
 let starting = false;
 let lastError = '';
+let lastAiError = '';
 let messagesCount = 0;
 let sessionsCount = 0;
 let reconnectFailures = 0;
@@ -99,6 +100,7 @@ async function persistMessage(msg, extra = {}) {
 
 async function askGroq(text) {
   const cfg = await ensureConfig();
+  const apiKey = String(cfg.groqApiKey || DEFAULT_GROQ_API_KEY || '').trim();
   const kb = Array.isArray(cfg.knowledge) ? cfg.knowledge : [];
   const faqs = Array.isArray(cfg.faqs) ? cfg.faqs : [];
   const quick = Array.isArray(cfg.quickReplies) ? cfg.quickReplies : [];
@@ -113,26 +115,29 @@ async function askGroq(text) {
     + (faqText ? '\n\nأسئلة شائعة (استفد منها كمرجع):\n' + faqText : '')
     + (qrText ? '\n\nتلميحات ردود سريعة:\n' + qrText : '')
     + guardrails;
-  if (!GROQ_API_KEY) throw new Error('GROQ_API_KEY missing');
+  if (!apiKey) throw new Error('GROQ_API_KEY missing: add it in Railway Variables or save it in bot settings');
   const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: 'Bearer ' + GROQ_API_KEY
+      Authorization: 'Bearer ' + apiKey
     },
     body: JSON.stringify({
       model: GROQ_MODEL,
       temperature: 0.7,
+      max_tokens: 450,
       messages: [
         { role: 'system', content: sys },
         { role: 'user', content: text }
       ]
     })
   });
-  if (!response.ok) throw new Error('Groq failed: ' + response.status);
-  const data = await response.json();
+  const raw = await response.text();
+  if (!response.ok) throw new Error('Groq failed: ' + response.status + ' - ' + raw.slice(0, 240));
+  const data = JSON.parse(raw);
   const out = data?.choices?.[0]?.message?.content;
   if (!out) throw new Error('Groq empty response');
+  lastAiError = '';
   return out;
 }
 
@@ -161,8 +166,10 @@ async function generateReply(text, from) {
     const ai = await askGroq(text);
     return (prefix + ai).trim();
   } catch (e) {
-    console.error('Groq generateReply failed:', e?.message);
-    return (prefix + (cfg.fallbackMessage || 'حصل خلل مؤقت في الذكاء الاصطناعي، سنعاود الرد قريباً.')).trim();
+    lastAiError = e?.message || String(e);
+    console.error('Groq generateReply failed:', lastAiError);
+    await logEvent('groq_error', { message: lastAiError }).catch(() => {});
+    return (prefix + (cfg.fallbackMessage || 'وصلت رسالتك، وسيرد عليك الفريق بعد قليل.')).trim();
   }
 }
 
@@ -276,7 +283,9 @@ app.get('/status', requireAuth, (_, res) => res.json({
   bot: BOT_NAME,
   messagesCount,
   sessionsCount,
-  lastError
+  lastError,
+  lastAiError,
+  aiConfigured: !!String((cfgCache && cfgCache.groqApiKey) || DEFAULT_GROQ_API_KEY || '').trim()
 }));
 
 app.post('/send', requireAuth, async (req, res) => {

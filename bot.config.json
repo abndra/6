@@ -12,7 +12,6 @@
   ],
   "requiredVariables": [
     "SERVICE_TOKEN",
-    "GROQ_API_KEY",
     "FIREBASE_SERVICE_ACCOUNT",
     "TAYSIR_STORE_ID",
     "TAYSIR_BOT_ID"
@@ -21,7 +20,8 @@
     "BOT_NAME",
     "SYSTEM_PROMPT",
     "GROQ_MODEL",
-    "SYNC_FULL_HISTORY"
+    "SYNC_FULL_HISTORY",
+    "GROQ_API_KEY if not saved in Taysir bot settings"
   ],
   "prompt": "أنت وكيل واتساب ذكي من تيسير. أجب بالعربية بوضوح، لا تخترع معلومات غير موجودة، وحوّل للمالك عند الحاجة."
 }
