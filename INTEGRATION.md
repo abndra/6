@@ -71,7 +71,6 @@ Restart أو Deploy في Railway ولا يظهر الهاتف كأنه سجّل 
 | `TAYSIR_STORE_ID` | id المتجر (`stores/xxxx`) |
 | `TAYSIR_BOT_ID` | id البوت (`stores/xxx/bots/yyy`) |
 | `SERVICE_TOKEN` | (اختياري) نفس قيمة `railwayApiKey` في إعدادات البوت |
-| `GROQ_API_KEY` | (اختياري) احتياطي فقط — الأساس أن يُقرأ لكل بوت من إعداداته |
 | `AI_POLL_INTERVAL_MS` | (اختياري) افتراضي 500ms — فحص احتياطي سريع لطابور الذكاء |
 | `OUTBOX_POLL_INTERVAL_MS` | (اختياري) افتراضي 500ms — فحص احتياطي سريع لطابور الإرسال |
 | `SNAPSHOT_POLL_INTERVAL_MS` | (اختياري) افتراضي 500ms — سرعة مراقبة الطوابير لحظياً |
@@ -80,8 +79,8 @@ Restart أو Deploy في Railway ولا يظهر الهاتف كأنه سجّل 
 | `EVENT_LOG_ENABLED` | (اختياري) افتراضي false — يقلّل كتابات/قراءات سجل الأحداث |
 
 > مفتاح Groq لكل بوت يُقرأ تلقائياً من Supabase
-> (`botSecrets/{botId}.groqApiKey` أو `bots/{botId}.groqApiKey`)، لذا كل بوت
-> يعمل بمفتاحه الخاص دون لمس متغيرات Railway.
+> (`botSecrets/{botId}.groqApiKey` أو `bots/{botId}.groqApiKey`) فقط، لذا كل بوت
+> يعمل بمفتاحه الخاص من اللوحة. لا تضع `GROQ_API_KEY` في Railway؛ إذا حُذف المفتاح من اللوحة يجب أن يتوقف الرد الذكي فوراً.
 
 ### 3) النشر
 ارفع محتوى مجلد `railway-server` إلى مستودع Railway ثم:

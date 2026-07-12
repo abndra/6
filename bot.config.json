@@ -1,7 +1,7 @@
 {
   "botName": "1",
-  "storeId": "s82S7kUvElKFZr0Wo5XP",
-  "botId": "fvhaRT8cqFytzfimeAMN",
+  "storeId": "cAGPFqAeV4PUjAPSzUOo",
+  "botId": "pJF4z28Y86j2ytbojUi0",
   "database": "supabase-documents",
   "filesVersion": "4.2.0",
   "filesVersionNote": "Instant mode: 0.5s queue watchers, fresh bot config on every message, parallel database writes",
@@ -28,7 +28,6 @@
   "optionalVariables": [
     "BOT_NAME",
     "GROQ_MODEL",
-    "GROQ_API_KEY",
     "NEW_MESSAGE_GRACE_SEC",
     "REMOTE_SESSION_BACKUP_MS",
     "AI_POLL_INTERVAL_MS",

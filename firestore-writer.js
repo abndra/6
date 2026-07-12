@@ -81,7 +81,7 @@ async function readCachedDoc(ref, cache, label) {
   }
 }
 
-async function readFreshDoc(ref, cache, label) {
+async function readFreshDoc(ref, cache, label, options = {}) {
   try {
     const snap = await ref.get();
     cache.data = snap.exists ? snap.data() : {};
@@ -89,6 +89,7 @@ async function readFreshDoc(ref, cache, label) {
     return cache.data;
   } catch (e) {
     logReadFailure(cache, label, e);
+    if (options.noStale) return {};
     return cache.data || {};
   }
 }
@@ -361,7 +362,7 @@ async function setConnectionState(patch, opts = {}) {
 // 8) قراءة إعدادات البوت + مفتاح Groq (يستخدمها عامل الذكاء)
 // ============================================================
 async function readBotSecrets(options = {}) {
-  return options.force ? readFreshDoc(botSecretsRef(), botSecretsCache, "botSecrets") : readCachedDoc(botSecretsRef(), botSecretsCache, "botSecrets");
+  return options.force ? readFreshDoc(botSecretsRef(), botSecretsCache, "botSecrets", { noStale: true }) : readCachedDoc(botSecretsRef(), botSecretsCache, "botSecrets");
 }
 
 async function readStoreConfig(options = {}) {

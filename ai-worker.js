@@ -10,8 +10,9 @@
 //     4) يكتب الرد في Supabase (المحادثة + طابور الإرسال outbox).
 //   خادم واتساب هو من يلتقط الرد من outbox ويرسله.
 //
-// مفتاح Groq يُقرأ لكل بوت من إعداداته في Supabase (botSecrets/{botId}.groqApiKey
-// أو bots/{botId}.groqApiKey)، ويمكن أيضاً تعيينه في GROQ_API_KEY كخيار احتياطي.
+// مفتاح Groq يُقرأ لكل بوت من إعداداته في Supabase فقط (botSecrets/{botId}.groqApiKey
+// أو bots/{botId}.groqApiKey). لا نستخدم GROQ_API_KEY من Railway حتى لا يستمر البوت بالرد
+// بعد حذف المفتاح من لوحة التحكم.
 //
 // dependencies: @supabase/supabase-js node-fetch@2
 // ============================================================
@@ -55,7 +56,9 @@ let botConfig = {
   products: [],
   quickReplies: [],
   faqs: [],
-  groqApiKey: process.env.GROQ_API_KEY || "",
+  groqApiKey: "",
+  storeName: "المتجر",
+  botName: "المساعد",
   language: "ar",
   temperature: 0.4,
   maxTokens: 350,
@@ -79,9 +82,9 @@ function textValue(...values) {
 }
 
 function mergeConfig(d = {}, secrets = {}, store = {}) {
-  const previousGroqKey = botConfig.groqApiKey || process.env.GROQ_API_KEY || "";
   const storeName = textValue(store.name, store.storeName, store.slug, "المتجر");
-  const defaultPersona = `أنت مساعد ذكي لمتجر ${storeName}. رد بلغة العميل باختصار ووضوح، واعتمد فقط على معلومات المتجر المحفوظة.`;
+  const botName = textValue(d.name, store.botName, "المساعد");
+  const defaultPersona = `أنت ${botName}، مساعد ذكي لمتجر ${storeName}. رد بلغة العميل باختصار ووضوح، واعتمد فقط على معلومات المتجر المحفوظة.`;
   botConfig = {
     greeting: textValue(d.greeting, store.greeting),
     closedMessage: textValue(d.closedMessage, d.offHoursMessage, store.closedMessage, store.offHoursMessage),
@@ -95,7 +98,10 @@ function mergeConfig(d = {}, secrets = {}, store = {}) {
     products: [...asArray(store.products), ...asArray(d.products)],
     quickReplies: [...asArray(store.quickReplies), ...asArray(d.quickReplies)],
     faqs: [...asArray(store.faqs), ...asArray(d.faqs)],
-    groqApiKey: textValue(secrets.groqApiKey, d.groqApiKey, store.groqApiKey, process.env.GROQ_API_KEY, previousGroqKey),
+    // مهم: لا نرجع للمفتاح السابق ولا لمتغير Railway. إذا حذفه المستخدم من اللوحة يجب أن يتوقف فوراً.
+    groqApiKey: textValue(secrets.groqApiKey, d.groqApiKey),
+    storeName,
+    botName,
     language: textValue(d.language, store.language, "ar"),
     temperature: typeof d.temperature === "number" ? Math.max(0, Math.min(1, d.temperature)) : botConfig.temperature,
     maxTokens: typeof d.maxTokens === "number" ? Math.max(80, Math.min(1200, d.maxTokens)) : botConfig.maxTokens,
@@ -160,7 +166,8 @@ function instantMatch(text) {
   // 1) الردود الجاهزة (trigger → reply)
   for (const q of botConfig.quickReplies) {
     const trig = normalize(q.trigger);
-    if (trig && (t === trig || t.includes(trig) || trig.includes(t))) return q.reply;
+    const reply = textValue(q.reply, q.answer, q.a, q.text);
+    if (trig && reply && (t === trig || t.includes(trig) || trig.includes(t) || tokenScore(t, trig) >= 0.5)) return reply;
   }
 
   // 2) الأسئلة الشائعة (تطابق قوي بالكلمات)
@@ -169,19 +176,28 @@ function instantMatch(text) {
   for (const f of botConfig.faqs) {
     const q = normalize(f.q);
     if (!q) continue;
-    if (t === q) return f.a;
+    const answer = textValue(f.a, f.answer, f.reply);
+    if (!answer) continue;
+    if (t === q) return answer;
     const words = q.split(" ").filter((w) => w.length > 2);
     if (!words.length) continue;
     const hit = words.filter((w) => t.includes(w)).length;
     const score = hit / words.length;
     if (score > bestScore) {
       bestScore = score;
-      best = f.a;
+      best = answer;
     }
   }
-  if (bestScore >= 0.7) return best;
+  if (bestScore >= 0.45) return best;
 
   return null;
+}
+
+function tokenScore(a, b) {
+  const aw = new Set(String(a || "").split(" ").filter((w) => w.length > 2));
+  const bw = String(b || "").split(" ").filter((w) => w.length > 2);
+  if (!aw.size || !bw.length) return 0;
+  return bw.filter((w) => aw.has(w) || [...aw].some((x) => x.includes(w) || w.includes(x))).length / bw.length;
 }
 
 function shouldHandOffToHuman(text) {
@@ -212,7 +228,10 @@ function isWithinWorkingHours() {
 // بناء system prompt من كل ما تعلّمه المستخدم
 // ============================================================
 function buildSystemPrompt() {
-  const parts = [botConfig.persona];
+  const parts = [
+    botConfig.persona,
+    `\n=== هوية المتجر والوكيل ===\nاسم المتجر: ${botConfig.storeName || "المتجر"}\nاسم الوكيل: ${botConfig.botName || "المساعد"}`,
+  ];
   if (botConfig.systemInstructions) parts.push("\n=== تعليمات النظام ===\n" + botConfig.systemInstructions);
   if (botConfig.tone) parts.push(`\n=== النبرة ===\n${botConfig.tone}`);
   if (botConfig.rules.length) {
@@ -298,13 +317,7 @@ async function processJob(phone, body, msgId, chatId = null) {
   const text = (body || "").trim();
   if (!text) return;
 
-  if (shouldHandOffToHuman(text)) {
-    await logEvent("human_handoff", { phone, msgId });
-    await markIncomingAiDone(phone, msgId, { aiResponse: null, aiSource: "human_handoff" });
-    return;
-  }
-
-  // 1) المتجر/البوت مغلق أو خارج ساعات العمل
+  // 1) المتجر/البوت مغلق أو خارج ساعات العمل — أعلى أولوية دائماً ولا يتجاوزها أي ذكاء/تحويل.
   if (!botConfig.isOpen) {
     const closed = botConfig.closedMessage || botConfig.offHoursMessage || DEFAULT_CLOSED_MESSAGE;
     await queueAiReply(phone, closed, { source: "closed", chatId });
@@ -314,6 +327,12 @@ async function processJob(phone, body, msgId, chatId = null) {
   if (!isWithinWorkingHours() && botConfig.offHoursMessage) {
     await queueAiReply(phone, botConfig.offHoursMessage, { source: "closed", chatId });
     await markIncomingAiDone(phone, msgId, { aiResponse: botConfig.offHoursMessage, aiSource: "closed" });
+    return;
+  }
+
+  if (shouldHandOffToHuman(text)) {
+    await logEvent("human_handoff", { phone, msgId });
+    await markIncomingAiDone(phone, msgId, { aiResponse: null, aiSource: "human_handoff" });
     return;
   }
 
@@ -340,6 +359,10 @@ async function processJob(phone, body, msgId, chatId = null) {
   } catch (e) {
     console.error("Groq failed:", e.message);
     await logEvent("groq_error", { phone, message: e.message });
+    if (/GROQ_API_KEY missing/i.test(String(e.message || ""))) {
+      await markIncomingAiError(phone, msgId, e.message);
+      return;
+    }
     await queueAiReply(phone, botConfig.fallbackMessage, { source: "fallback", chatId });
     await markIncomingAiError(phone, msgId, e.message);
   }
