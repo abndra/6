@@ -2,17 +2,17 @@
 // server.js — خادم واتساب (جسر فقط) — لا علاقة له بالذكاء الاصطناعي
 // ============================================================
 // مسؤوليته الوحيدة:
-//   (1) استقبال رسائل واتساب  → حفظها فوراً في Firestore.
-//   (2) مراقبة طابور الإرسال (outbox) في Firestore → إرسال أي رد جديد
+//   (1) استقبال رسائل واتساب  → حفظها فوراً في Supabase.
+//   (2) مراقبة طابور الإرسال (outbox) في Supabase → إرسال أي رد جديد
 //       إلى الرقم فور ظهوره.
 //
 // هو لا يعرف شيئاً عن Groq ولا يبني أي رد. الذكاء يعمل في ai-worker.js.
 //
 // المتغيرات المطلوبة في Railway → Variables:
-//   FIREBASE_SERVICE_ACCOUNT, TAYSIR_STORE_ID, TAYSIR_BOT_ID
+//   APP_SUPABASE_URL, APP_SUPABASE_SECRET_KEY, TAYSIR_STORE_ID, TAYSIR_BOT_ID
 //   SERVICE_TOKEN (اختياري) = نفس قيمة railwayApiKey في إعدادات البوت
 //
-// dependencies: whatsapp-web.js qrcode-terminal qrcode firebase-admin express
+// dependencies: whatsapp-web.js qrcode-terminal qrcode @supabase/supabase-js express
 // ============================================================
 
 const { Client, RemoteAuth } = require("whatsapp-web.js");
@@ -37,7 +37,7 @@ const {
   isRealCustomer,
   customerIdFromJid,
 } = require("./firestore-writer");
-const { createFirestoreRemoteStore } = require("./firestore-session-store");
+const { createFirestoreRemoteStore, deleteRemoteSessionById } = require("./firestore-session-store");
 
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "";
 // نقبل الرسائل القريبة من لحظة الربط حتى لا تُرفض بسبب فرق توقيت واتساب،
@@ -47,11 +47,13 @@ const NEW_MESSAGE_GRACE_SEC = Number(process.env.NEW_MESSAGE_GRACE_SEC || 45);
 // خمس دقائق كافية لحفظ الجلسة باستمرار وتمنع OOM على خطط Railway الصغيرة.
 const REMOTE_SESSION_BACKUP_MS = Math.max(60000, Number(process.env.REMOTE_SESSION_BACKUP_MS || 300000));
 const REMOTE_SESSION_CLIENT_ID = String(process.env.REMOTE_SESSION_CLIENT_ID || `${STORE_ID}_${BOT_ID}`).replace(/[^a-z0-9_-]/gi, "_");
-const OUTBOX_POLL_INTERVAL_MS = Math.max(3000, Number(process.env.OUTBOX_POLL_INTERVAL_MS || 5000));
+const OUTBOX_POLL_INTERVAL_MS = Math.max(15000, Number(process.env.OUTBOX_POLL_INTERVAL_MS || 30000));
 // getChats/fetchMessages يحمّل بيانات كثيرة من واتساب. نجعله شبكة أمان خفيفة فقط، لا فحصاً كل 30 ثانية.
-const MESSAGE_SWEEP_INTERVAL_MS = Math.max(60000, Number(process.env.MESSAGE_SWEEP_INTERVAL_MS || 300000));
+const MESSAGE_SWEEP_ENABLED = String(process.env.MESSAGE_SWEEP_ENABLED || "false").toLowerCase() === "true";
+const MESSAGE_SWEEP_INTERVAL_MS = Math.max(300000, Number(process.env.MESSAGE_SWEEP_INTERVAL_MS || 600000));
 const MESSAGE_SWEEP_LIMIT = Math.max(3, Math.min(10, Number(process.env.MESSAGE_SWEEP_LIMIT || 5)));
 const WA_STATE_TIMEOUT_MS = Math.max(3000, Number(process.env.WA_STATE_TIMEOUT_MS || 7000));
+const CONNECTION_VERIFY_INTERVAL_MS = Math.max(30000, Number(process.env.CONNECTION_VERIFY_INTERVAL_MS || 60000));
 
 // ---- عميل واتساب ----
 const client = new Client({
@@ -223,7 +225,7 @@ client.on("ready", async () => {
 
 client.on("remote_session_saved", async () => {
   remoteSessionSaved = true;
-  console.log("✓ تم حفظ جلسة واتساب في Firestore — لن تضيع بعد Restart/Deploy");
+  console.log("✓ تم حفظ جلسة واتساب في Supabase — لن تضيع بعد Restart/Deploy");
   await logEvent("remote_session_saved", {});
   await setConnectionState({ remoteSessionSaved: true });
 });
@@ -249,7 +251,7 @@ client.on("disconnected", async (reason) => {
 
 setInterval(() => {
   triggerConnectionVerify();
-}, 15000).unref?.();
+}, CONNECTION_VERIFY_INTERVAL_MS).unref?.();
 
 async function handleIncomingMessage(msg, source = "event") {
   try {
@@ -298,9 +300,11 @@ async function sweepRecentMessages() {
   }
 }
 
-setInterval(() => {
-  sweepRecentMessages().catch((e) => console.error("message sweep failed:", e.message));
-}, MESSAGE_SWEEP_INTERVAL_MS).unref?.();
+if (MESSAGE_SWEEP_ENABLED) {
+  setInterval(() => {
+    sweepRecentMessages().catch((e) => console.error("message sweep failed:", e.message));
+  }, MESSAGE_SWEEP_INTERVAL_MS).unref?.();
+}
 
 // ---- الرسائل الصادرة يدوياً من الهاتف نفسه: حفظ للعرض (الجديدة فقط) ----
 client.on("message_create", async (msg) => {
@@ -369,7 +373,7 @@ async function drainPendingOutbox(reason = "poll") {
   if (connectionState !== "connected") return;
   const live = await verifyConnectionState({ persist: true });
   if (live.connected === false) return;
-  const pend = await botRef().collection("outbox").where("status", "==", "pending").limit(25).get();
+  const pend = await botRef().collection("outbox").where("status", "==", "pending").limit(10).get();
   pend.forEach((d) => startOutboxDoc(d));
   await setConnectionState({ outboxHeartbeatAt: admin.firestore.FieldValue.serverTimestamp(), outboxPendingSeen: pend.size, outboxLastDrainReason: reason });
 }
@@ -442,16 +446,8 @@ function auth(req) {
 app.get("/", (_req, res) => res.json({ ok: true, service: "whatsapp-bridge", storeId: STORE_ID, botId: BOT_ID }));
 
 app.get("/health", async (_req, res) => {
-  try {
-    await Promise.race([
-      botRef().get(),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("Firestore healthcheck timeout")), 8000)),
-    ]);
-    res.json({ ok: true, service: "whatsapp-bridge", firestore: true, storeId: STORE_ID, botId: BOT_ID, connectionState });
-  } catch (error) {
-    lastError = errorMessage(error);
-    res.status(500).json({ ok: false, service: "whatsapp-bridge", firestore: false, error: lastError, storeId: STORE_ID, botId: BOT_ID });
-  }
+  // لا نقرأ قاعدة البيانات هنا: Railway/المراقبات تضرب /health كثيراً.
+  res.json({ ok: true, service: "whatsapp-bridge", database: "not_checked_to_save_resources", storeId: STORE_ID, botId: BOT_ID, connectionState });
 });
 
 app.get("/status", async (_req, res) => {
@@ -522,6 +518,7 @@ app.post("/reset-session", async (req, res) => {
   try {
     await client.logout().catch(() => {});
     await client.destroy().catch(() => {});
+    await deleteRemoteSessionById(client.authStrategy?.sessionName || `RemoteAuth-${REMOTE_SESSION_CLIENT_ID}`).catch(() => {});
     await fs.rm(path.resolve("./.wwebjs_auth"), { recursive: true, force: true });
     await fs.rm(path.resolve("./.wwebjs_cache"), { recursive: true, force: true });
     latestQrRaw = null;

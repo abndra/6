@@ -1,38 +1,22 @@
 // ============================================================
-// firestore-writer.js — طبقة البيانات المشتركة (Firestore)
+// firestore-writer.js — طبقة البيانات المشتركة (Supabase)
 // ============================================================
-// هذا الملف هو الجسر الوحيد بين خادم واتساب وعامل الذكاء و Firestore.
+// هذا الملف هو الجسر الوحيد بين خادم واتساب وعامل الذكاء و Supabase.
 // لا يحتوي على أي منطق واتساب ولا أي منطق Groq — فقط قراءة/كتابة.
 //
 // المتغيرات المطلوبة في Railway → Variables:
-//   FIREBASE_SERVICE_ACCOUNT = محتوى ملف serviceAccountKey.json كامل (JSON)
+//   APP_SUPABASE_URL         = رابط مشروع Supabase
+//   APP_SUPABASE_SECRET_KEY  = المفتاح السري / service role من Supabase
 //   TAYSIR_STORE_ID          = id المتجر  (stores/{storeId})
 //   TAYSIR_BOT_ID            = id البوت   (stores/{storeId}/bots/{botId})
 // ============================================================
 
-const admin = require("firebase-admin");
-const { getFirestore } = require("firebase-admin/firestore");
+// ---- تهيئة طبقة التوافق (Supabase تحت الغطاء) ----
+const { admin, getFirestore, FieldValue } = require("./firestore-compat");
 const crypto = require("crypto");
 
-// ---- تهيئة Firebase Admin مرة واحدة فقط ----
-if (!admin.apps.length) {
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
-  if (!raw) {
-    throw new Error("FIREBASE_SERVICE_ACCOUNT is missing in Railway Variables");
-  }
-  let svc;
-  try {
-    svc = JSON.parse(raw);
-  } catch (e) {
-    throw new Error("FIREBASE_SERVICE_ACCOUNT is not valid JSON: " + e.message);
-  }
-  admin.initializeApp({ credential: admin.credential.cert(svc) });
-}
+if (!admin.apps.length) admin.initializeApp();
 
-const FieldValue = admin.firestore.FieldValue;
-
-// معرّفات المتجر/البوت: تُقرأ من متغيرات Railway، وإن لم توجد تُقرأ تلقائياً
-// من bot.config.json المرفق داخل ملفات GitHub — فلا حاجة لإضافتها يدوياً.
 function readEmbeddedConfig() {
   try {
     return require("./bot.config.json") || {};
@@ -43,8 +27,8 @@ function readEmbeddedConfig() {
 const embeddedConfig = readEmbeddedConfig();
 const STORE_ID = process.env.TAYSIR_STORE_ID || embeddedConfig.storeId;
 const BOT_ID = process.env.TAYSIR_BOT_ID || embeddedConfig.botId;
-const FIRESTORE_DATABASE_ID = process.env.FIRESTORE_DATABASE_ID || embeddedConfig.firestoreDatabaseId || "default";
-const db = getFirestore(admin.app(), FIRESTORE_DATABASE_ID);
+const db = getFirestore();
+
 
 if (!STORE_ID || !BOT_ID) {
   throw new Error(
@@ -57,6 +41,51 @@ const storeRef = () => db.collection("stores").doc(STORE_ID);
 const botRef = () => storeRef().collection("bots").doc(BOT_ID);
 const botSecretsRef = () => db.collection("stores").doc(STORE_ID).collection("botSecrets").doc(BOT_ID);
 const now = () => FieldValue.serverTimestamp();
+
+// تقليل استهلاك قاعدة البيانات: لا نسجل أحداثاً تفصيلية إلا عند تفعيلها صراحة،
+// ونحتفظ بإعدادات البوت في الذاكرة حتى لا ينهار الرد عند ضغط/انقطاع مؤقت في الكوتا.
+const EVENT_LOG_ENABLED = String(process.env.EVENT_LOG_ENABLED || "false").toLowerCase() === "true";
+const CONFIG_CACHE_MS = Math.max(60_000, Number(process.env.SUPABASE_CONFIG_CACHE_MS || process.env.FIRESTORE_CONFIG_CACHE_MS || 600_000));
+const CONNECTION_STATE_MIN_WRITE_MS = Math.max(15_000, Number(process.env.CONNECTION_STATE_MIN_WRITE_MS || 60_000));
+let botSecretsCache = { data: null, expiresAt: 0, lastErrorLogAt: 0 };
+let storeConfigCache = { data: null, expiresAt: 0, lastErrorLogAt: 0 };
+let lastConnectionStateWriteAt = 0;
+
+function isQuotaError(e) {
+  return e?.code === 8 || /RESOURCE_EXHAUSTED|Quota limit exceeded/i.test(String(e?.message || e || ""));
+}
+
+function logReadFailure(cache, label, error) {
+  const t = Date.now();
+  if (t - cache.lastErrorLogAt < 60_000) return;
+  cache.lastErrorLogAt = t;
+  console.error(`${label} read failed:`, error.message);
+}
+
+async function readCachedDoc(ref, cache, label) {
+  const t = Date.now();
+  if (cache.data && t < cache.expiresAt) return cache.data;
+  try {
+    const snap = await ref.get();
+    cache.data = snap.exists ? snap.data() : {};
+    cache.expiresAt = t + CONFIG_CACHE_MS;
+    return cache.data;
+  } catch (e) {
+    logReadFailure(cache, label, e);
+    if (cache.data) {
+      // عند ضغط قاعدة البيانات نستمر بآخر إعداد معروف بدلاً من إسقاط Groq/المعرفة إلى قيم فارغة.
+      cache.expiresAt = t + (isQuotaError(e) ? CONFIG_CACHE_MS : 30_000);
+      return cache.data;
+    }
+    return {};
+  }
+}
+
+function hasImportantConnectionPatch(patch = {}) {
+  return ["connectionState", "status", "waConnected", "lastQr", "phoneNumber", "lastError", "remoteSessionSaved", "waState"].some((key) =>
+    Object.prototype.hasOwnProperty.call(patch, key),
+  );
+}
 
 // ---- أدوات مساعدة ----
 function phoneFromJid(jid) {
@@ -139,57 +168,57 @@ async function saveIncomingMessage(msg) {
   // 2.a) رأس المحادثة
   const convRef = botRef().collection("conversations").doc(phone);
   const msgDoc = convRef.collection("messages").doc(messageDocId);
-  const alreadySaved = await msgDoc.get();
-  if (alreadySaved.exists) return null;
 
-  await convRef.set(
-    {
-      phone,
-      rawPhone,
+  // Batch واحد بدون قراءة مسبقة: يقلل قراءات قاعدة البيانات لكل رسالة.
+  const batch = db.batch();
+  try {
+    batch.create(msgDoc, {
+      from: jid,
       chatId,
-      jidDomain: jidDomain(jid),
+      fromMe: false,
+      body,
+      type: msg.type || "text",
+      mediaUrl: null,
+      timestamp: now(),
+      aiStatus: "pending",
+      raw: { id: msg.id?._serialized || null },
+    });
+    batch.set(
+      convRef,
+      {
+        phone,
+        rawPhone,
+        chatId,
+        jidDomain: jidDomain(jid),
+        name,
+        lastMessage: body || `[${msg.type}]`,
+        updatedAt: now(),
+        unreadCount: FieldValue.increment(1),
+      },
+      { merge: true },
+    );
+    batch.set(botRef().collection("messages").doc(messageDocId), {
+      conversationId: phone,
+      chatId,
+      fromMe: false,
+      body,
+      timestamp: now(),
+    });
+    batch.set(botRef(), { messagesCount: FieldValue.increment(1), lastMessageAt: now() }, { merge: true });
+    batch.set(botRef().collection("aiQueue").doc(messageDocId), {
+      phone,
+      chatId,
       name,
-      lastMessage: body || `[${msg.type}]`,
-      updatedAt: now(),
-      unreadCount: FieldValue.increment(1),
-    },
-    { merge: true },
-  );
-
-  // 2.b) الرسالة داخل المحادثة (للعرض في لوحة المتجر)
-  await msgDoc.set({
-    from: jid,
-    chatId,
-    fromMe: false,
-    body,
-    type: msg.type || "text",
-    mediaUrl: null,
-    timestamp: now(),
-    aiStatus: "pending",
-    raw: { id: msg.id?._serialized || null },
-  });
-
-  // 2.c) نسخة مسطّحة للعدّاد السريع
-  await botRef().collection("messages").doc(messageDocId).set({
-    conversationId: phone,
-    chatId,
-    fromMe: false,
-    body,
-    timestamp: now(),
-  });
-
-  await botRef().set({ messagesCount: FieldValue.increment(1), lastMessageAt: now() }, { merge: true });
-
-  // 2.d) طابور الذكاء — العامل المنفصل يستمع لهذه المجموعة
-  await botRef().collection("aiQueue").doc(messageDocId).set({
-    phone,
-    chatId,
-    name,
-    body,
-    msgId: msgDoc.id,
-    status: "pending",
-    createdAt: now(),
-  });
+      body,
+      msgId: msgDoc.id,
+      status: "pending",
+      createdAt: now(),
+    });
+    await batch.commit();
+  } catch (e) {
+    if (e?.code === 6 || /ALREADY_EXISTS/i.test(String(e?.message || ""))) return null;
+    throw e;
+  }
 
   return { phone, name, body, msgId: msgDoc.id };
 }
@@ -298,6 +327,7 @@ async function markOutboxError(outboxId, message) {
 // 6) سجل الأحداث
 // ============================================================
 async function logEvent(type, payload = {}) {
+  if (!EVENT_LOG_ENABLED) return;
   try {
     await botRef().collection("events").add({ type, payload, at: now() });
   } catch (e) {
@@ -308,7 +338,10 @@ async function logEvent(type, payload = {}) {
 // ============================================================
 // 7) حالة الاتصال + QR (يكتبها خادم واتساب)
 // ============================================================
-async function setConnectionState(patch) {
+async function setConnectionState(patch, opts = {}) {
+  const t = Date.now();
+  if (!opts.force && !hasImportantConnectionPatch(patch) && t - lastConnectionStateWriteAt < CONNECTION_STATE_MIN_WRITE_MS) return;
+  lastConnectionStateWriteAt = t;
   await botRef().set({ ...patch, updatedAt: now() }, { merge: true }).catch((e) => console.error("setConnectionState:", e.message));
 }
 
@@ -316,23 +349,11 @@ async function setConnectionState(patch) {
 // 8) قراءة إعدادات البوت + مفتاح Groq (يستخدمها عامل الذكاء)
 // ============================================================
 async function readBotSecrets() {
-  try {
-    const snap = await botSecretsRef().get();
-    return snap.exists ? snap.data() : {};
-  } catch (e) {
-    console.error("botSecrets read failed:", e.message);
-    return {};
-  }
+  return readCachedDoc(botSecretsRef(), botSecretsCache, "botSecrets");
 }
 
 async function readStoreConfig() {
-  try {
-    const snap = await storeRef().get();
-    return snap.exists ? snap.data() : {};
-  } catch (e) {
-    console.error("store config read failed:", e.message);
-    return {};
-  }
+  return readCachedDoc(storeRef(), storeConfigCache, "store config");
 }
 
 module.exports = {

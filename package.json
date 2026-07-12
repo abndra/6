@@ -1,8 +1,8 @@
 {
   "name": "taysir-railway-server",
-  "version": "3.3.0",
+  "version": "4.0.0",
   "private": true,
-  "description": "خادم واتساب (جسر) + عامل ذكاء Groq منفصل عبر Firestore",
+  "description": "خادم واتساب (جسر) + عامل ذكاء Groq منفصل عبر Supabase",
   "main": "index.js",
   "engines": {
     "node": ">=18"
@@ -13,9 +13,9 @@
     "start:ai": "node ai-worker.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
     "archiver": "^5.3.1",
     "express": "^4.19.2",
-    "firebase-admin": "^12.7.0",
     "fs-extra": "^10.1.0",
     "node-fetch": "^2.7.0",
     "qrcode": "^1.5.4",

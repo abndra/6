@@ -2,18 +2,18 @@
 // ai-worker.js — عامل الذكاء الاصطناعي (Groq) — منفصل تماماً عن واتساب
 // ============================================================
 // مسؤوليته الوحيدة:
-//   يستمع لطابور الذكاء (aiQueue) في Firestore. عند وصول رسالة جديدة:
+//   يستمع لطابور الذكاء (aiQueue) في Supabase. عند وصول رسالة جديدة:
 //     1) يقرأها بسرعة.
 //     2) يبحث في إعدادات البوت: هل مغلق؟ هل يوجد رد جاهز/سؤال شائع مطابق؟
 //        (رد فوري بدون استدعاء أي API — سرعة قصوى).
 //     3) إن لم يجد شيئاً → يستدعي Groq مع قاعدة المعرفة والقوانين كسياق.
-//     4) يكتب الرد في Firestore (المحادثة + طابور الإرسال outbox).
+//     4) يكتب الرد في Supabase (المحادثة + طابور الإرسال outbox).
 //   خادم واتساب هو من يلتقط الرد من outbox ويرسله.
 //
-// مفتاح Groq يُقرأ لكل بوت من إعداداته في Firestore (botSecrets/{botId}.groqApiKey
+// مفتاح Groq يُقرأ لكل بوت من إعداداته في Supabase (botSecrets/{botId}.groqApiKey
 // أو bots/{botId}.groqApiKey)، ويمكن أيضاً تعيينه في GROQ_API_KEY كخيار احتياطي.
 //
-// dependencies: firebase-admin node-fetch@2
+// dependencies: @supabase/supabase-js node-fetch@2
 // ============================================================
 
 const fetch = require("node-fetch");
@@ -32,12 +32,14 @@ const {
 
 const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 const STALE_PROCESSING_MS = Number(process.env.AI_STALE_PROCESSING_MS || 120000);
-const AI_POLL_INTERVAL_MS = Math.max(3000, Number(process.env.AI_POLL_INTERVAL_MS || 5000));
-const AI_RECOVER_INTERVAL_MS = Math.max(15000, Number(process.env.AI_RECOVER_INTERVAL_MS || 30000));
+const AI_POLL_INTERVAL_MS = Math.max(30000, Number(process.env.AI_POLL_INTERVAL_MS || 60000));
+const AI_RECOVER_INTERVAL_MS = Math.max(120000, Number(process.env.AI_RECOVER_INTERVAL_MS || 300000));
 const AI_GROQ_TIMEOUT_MS = Math.max(10000, Number(process.env.AI_GROQ_TIMEOUT_MS || 30000));
 const AI_MAX_CONCURRENT = Math.max(1, Math.min(5, Number(process.env.AI_MAX_CONCURRENT || 2)));
+const AI_CONFIG_REFRESH_MS = Math.max(60000, Number(process.env.AI_CONFIG_REFRESH_MS || 600000));
+const AI_HEARTBEAT_WRITE_MS = Math.max(60000, Number(process.env.AI_HEARTBEAT_WRITE_MS || 300000));
 
-// ---- إعدادات البوت الحيّة (تُحدّث لحظياً من Firestore) ----
+// ---- إعدادات البوت الحيّة (تُحدّث دورياً من Supabase) ----
 let botConfig = {
   greeting: "",
   closedMessage: "",
@@ -60,6 +62,7 @@ let botConfig = {
   humanHandoff: false,
   humanHandoffTrigger: "",
 };
+let lastAiHeartbeatAt = 0;
 
 function asArray(value) {
   return Array.isArray(value) ? value.filter(Boolean) : [];
@@ -118,30 +121,21 @@ async function refreshConfig(d) {
   );
 }
 
-botRef().onSnapshot(
-  (snap) => {
-    if (snap.exists) refreshConfig(snap.data()).catch((e) => console.error("refreshConfig:", e.message));
-  },
-  (err) => console.error("config listener error:", err.message),
-);
+async function refreshConfigFromSupabase(reason = "interval") {
+  try {
+    const botSnap = await botRef().get();
+    await refreshConfig(botSnap.exists ? botSnap.data() : {});
+  } catch (e) {
+    console.error(`config refresh failed (${reason}):`, e.message);
+    // لا نفرّغ الإعدادات عند نفاد الكوتا؛ نكمل بآخر إعداد محفوظ في الذاكرة.
+  }
+}
 
-botSecretsRef().onSnapshot(
-  async (snap) => {
-    const [botSnap, store] = await Promise.all([botRef().get(), readStoreConfig()]);
-    mergeConfig(botSnap.exists ? botSnap.data() : {}, snap.exists ? snap.data() : {}, store);
-    console.log("✓ أسرار البوت محدّثة | Groq key:", botConfig.groqApiKey ? "موجود" : "غير موجود");
-  },
-  (err) => console.error("botSecrets listener error:", err.message),
-);
-
-storeRef().onSnapshot(
-  async (snap) => {
-    const [botSnap, secrets] = await Promise.all([botRef().get(), readBotSecrets()]);
-    mergeConfig(botSnap.exists ? botSnap.data() : {}, secrets, snap.exists ? snap.data() : {});
-    console.log("✓ إعدادات المتجر محدّثة | Groq key:", botConfig.groqApiKey ? "موجود" : "غير موجود");
-  },
-  (err) => console.error("store listener error:", err.message),
-);
+// مهم: لا نستخدم مراقبة مباشرة على وثيقة البوت لأنها تتغير مع كل health/status heartbeat.
+refreshConfigFromSupabase("startup").catch(() => {});
+setInterval(() => {
+  refreshConfigFromSupabase("interval").catch(() => {});
+}, AI_CONFIG_REFRESH_MS).unref?.();
 
 // ============================================================
 // مطابقة فورية من إعدادات البوت (بدون Groq)
@@ -419,15 +413,19 @@ async function drainPendingJobs(reason = "poll") {
       });
       if (!started) break;
     }
-    await botRef().set(
-      {
-        aiWorkerStatus: "running",
-        aiWorkerHeartbeatAt: FieldValue.serverTimestamp(),
-        aiWorkerProcessing: processing.size,
-        aiWorkerLastDrainReason: reason,
-      },
-      { merge: true },
-    );
+    const t = Date.now();
+    if (t - lastAiHeartbeatAt >= AI_HEARTBEAT_WRITE_MS) {
+      lastAiHeartbeatAt = t;
+      await botRef().set(
+        {
+          aiWorkerStatus: "running",
+          aiWorkerHeartbeatAt: FieldValue.serverTimestamp(),
+          aiWorkerProcessing: processing.size,
+          aiWorkerLastDrainReason: reason,
+        },
+        { merge: true },
+      );
+    }
   } catch (e) {
     console.error("ai queue drain error:", e.message);
     await logEvent("ai_queue_drain_error", { message: e.message }).catch(() => {});

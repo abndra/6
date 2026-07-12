@@ -1,11 +1,11 @@
 {
   "botName": "1",
-  "storeId": "RTdIAtwTwu2FKViEzbBe",
-  "botId": "sF8d1BUjlJGEqZlUSN22",
-  "firestoreDatabaseId": "default",
-  "filesVersion": "3.4.0",
-  "filesVersionNote": "Memory-safe RemoteAuth session streaming + locked session saves + lighter WhatsApp watchdogs",
-  "architecture": "whatsapp-bridge + firestore aiQueue/outbox + groq ai-worker + firestore remote session",
+  "storeId": "cAGPFqAeV4PUjAPSzUOo",
+  "botId": "pJF4z28Y86j2ytbojUi0",
+  "database": "supabase-documents",
+  "filesVersion": "4.0.0",
+  "filesVersionNote": "Supabase-only Railway package; no Firebase service account or Firestore variables required",
+  "architecture": "whatsapp-bridge + supabase documents aiQueue/outbox + groq ai-worker + supabase remote session",
   "messages": "الرسائل الجديدة فقط بعد الربط — لا استيراد للمحادثات القديمة",
   "endpoints": [
     "GET /health",
@@ -17,8 +17,9 @@
     "POST /reset-session"
   ],
   "requiredVariables": [
-    "SERVICE_TOKEN",
-    "FIREBASE_SERVICE_ACCOUNT"
+    "APP_SUPABASE_URL",
+    "APP_SUPABASE_SECRET_KEY",
+    "SERVICE_TOKEN"
   ],
   "embeddedVariables": [
     "TAYSIR_STORE_ID",
@@ -28,7 +29,6 @@
     "BOT_NAME",
     "GROQ_MODEL",
     "GROQ_API_KEY",
-    "FIRESTORE_DATABASE_ID",
     "NEW_MESSAGE_GRACE_SEC",
     "REMOTE_SESSION_BACKUP_MS",
     "AI_POLL_INTERVAL_MS",
@@ -36,7 +36,14 @@
     "AI_GROQ_TIMEOUT_MS",
     "AI_MAX_CONCURRENT",
     "OUTBOX_POLL_INTERVAL_MS",
+    "MESSAGE_SWEEP_ENABLED",
     "MESSAGE_SWEEP_INTERVAL_MS",
-    "MESSAGE_SWEEP_LIMIT"
+    "MESSAGE_SWEEP_LIMIT",
+    "AI_CONFIG_REFRESH_MS",
+    "AI_HEARTBEAT_WRITE_MS",
+    "CONNECTION_VERIFY_INTERVAL_MS",
+    "EVENT_LOG_ENABLED",
+    "SUPABASE_CONFIG_CACHE_MS",
+    "CONNECTION_STATE_MIN_WRITE_MS"
   ]
 }
