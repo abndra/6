@@ -1,8 +1,8 @@
 {
-  "name": "taysir-railway-server",
-  "version": "2.0.0",
+  "name": "taysir-whatsapp-server",
+  "version": "2.1.0",
   "private": true,
-  "description": "خادم واتساب (جسر) + عامل ذكاء Groq منفصل عبر Firestore",
+  "description": "خادم واتساب جسر + عامل ذكاء Groq منفصل عبر Firestore",
   "main": "index.js",
   "engines": {
     "node": ">=18"

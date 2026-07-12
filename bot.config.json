@@ -2,9 +2,11 @@
   "botName": "6",
   "storeId": "zj4KW4k2kiInawdlofxD",
   "botId": "6fZIB8yfDE2QCzn21JKM",
-  "railwayServerName": "taysir-whatsapp-server",
+  "filesVersion": "2.1.0",
+  "architecture": "whatsapp-bridge + firestore aiQueue/outbox + groq ai-worker",
   "endpoints": [
     "GET /status",
+    "GET /qr",
     "POST /send",
     "POST /restart",
     "POST /logout",
@@ -18,10 +20,8 @@
   ],
   "optionalVariables": [
     "BOT_NAME",
-    "SYSTEM_PROMPT",
     "GROQ_MODEL",
-    "SYNC_FULL_HISTORY",
-    "GROQ_API_KEY if not saved in Taysir bot settings"
+    "GROQ_API_KEY"
   ],
   "prompt": "أنت وكيل واتساب ذكي من تيسير. أجب بالعربية بوضوح، لا تخترع معلومات غير موجودة، وحوّل للمالك عند الحاجة."
 }

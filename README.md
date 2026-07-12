@@ -1,21 +1,19 @@
 # 6
 
-ملفات سيرفر واتساب الجاهزة للرفع على GitHub ثم Railway.
+ملفات سيرفر واتساب الجديدة للرفع على GitHub ثم Railway.
+
+البنية: واتساب يستقبل ويحفظ في Firestore، عامل الذكاء يقرأ `aiQueue` ويكتب الرد في `outbox`، ثم واتساب يرسل الرد فوراً.
 
 ## Railway Variables
 
-ضع هذه القيم في Railway > Variables:
-
 ```env
 SERVICE_TOKEN=نفس التوكن الذي تحفظه في لوحة تيسير
-GROQ_API_KEY=اختياري إذا كان مفتاح Groq محفوظاً في إعدادات البوت داخل تيسير
+GROQ_API_KEY=اختياري إذا كان مفتاح Groq محفوظاً داخل إعدادات البوت
 BOT_NAME=6
-SYSTEM_PROMPT=أنت وكيل واتساب ذكي من تيسير. أجب بالعربية بوضوح، لا تخترع معلومات غير موجودة، وحوّل للمالك عند الحاجة.
 GROQ_MODEL=llama-3.3-70b-versatile
 FIREBASE_SERVICE_ACCOUNT=الصق JSON كامل
 TAYSIR_STORE_ID=zj4KW4k2kiInawdlofxD
 TAYSIR_BOT_ID=6fZIB8yfDE2QCzn21JKM
-SYNC_FULL_HISTORY=true
 ```
 
 ## التشغيل
@@ -29,13 +27,8 @@ SYNC_FULL_HISTORY=true
 ## Endpoints
 
 - `GET /status` يعرض الحالة والـ QR.
-- `POST /send` يرسل رسالة واتساب.
+- `GET /qr` يعرض QR فقط.
+- `POST /send` يرسل رسالة واتساب يدوياً.
 - `POST /restart` يعيد تشغيل جلسة واتساب.
-- `POST /logout` يصفّر جلسة واتساب ويفرض ظهور QR جديد.
-- `POST /reset-session` نفس وظيفة التصفير عند تعلّق الحالة على reconnecting.
-
-كل الطلبات المحمية تستخدم:
-
-```http
-Authorization: Bearer SERVICE_TOKEN
-```
+- `POST /logout` يصفّر جلسة واتساب.
+- `POST /reset-session` يعيد تشغيل جلسة الربط.
