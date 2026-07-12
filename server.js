@@ -37,6 +37,9 @@ const {
 } = require("./firestore-writer");
 
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "";
+// نقبل الرسائل القريبة من لحظة الربط حتى لا تُرفض بسبب فرق توقيت واتساب،
+// وفي نفس الوقت لا نستورد المحادثات القديمة جداً.
+const NEW_MESSAGE_GRACE_SEC = Number(process.env.NEW_MESSAGE_GRACE_SEC || 45);
 
 // ---- عميل واتساب ----
 const client = new Client({
@@ -91,7 +94,7 @@ client.on("ready", async () => {
   connectionState = "connected";
   latestQrRaw = null;
   latestQrDataUrl = null;
-  readyAtSec = Math.floor(Date.now() / 1000);
+  readyAtSec = Math.floor(Date.now() / 1000) - NEW_MESSAGE_GRACE_SEC;
   console.log("✓ WhatsApp متصل — سيتم حفظ الرسائل الجديدة فقط بعد هذه اللحظة");
   await logEvent("connected");
 
@@ -127,7 +130,8 @@ client.on("message", async (msg) => {
     // تجاهل أي رسالة وصلت قبل اكتمال الربط (رسائل قديمة/مزامنة أولية)
     if (readyAtSec && Number(msg.timestamp) && Number(msg.timestamp) < readyAtSec) return;
     await upsertCustomer(msg);
-    await saveIncomingMessage(msg); // → يضعها في aiQueue ليقرأها عامل الذكاء
+    const saved = await saveIncomingMessage(msg); // → يضعها في aiQueue ليقرأها عامل الذكاء
+    if (saved) await logEvent("incoming_saved", { phone: saved.phone, msgId: saved.msgId, type: msg.type || "text" });
   } catch (e) {
     console.error("message handler error:", e);
     await logEvent("error", { where: "incoming", message: e.message });
@@ -270,6 +274,8 @@ app.get("/status", (_req, res) => {
     qr: latestQrRaw,
     qrDataUrl: latestQrDataUrl,
     lastError,
+    readyAtSec,
+    newMessageGraceSec: NEW_MESSAGE_GRACE_SEC,
     uptimeSec: Math.floor(process.uptime()),
     serverTime: new Date().toISOString(),
   });

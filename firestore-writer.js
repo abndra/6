@@ -52,7 +52,8 @@ if (!STORE_ID || !BOT_ID) {
 }
 
 
-const botRef = () => db.collection("stores").doc(STORE_ID).collection("bots").doc(BOT_ID);
+const storeRef = () => db.collection("stores").doc(STORE_ID);
+const botRef = () => storeRef().collection("bots").doc(BOT_ID);
 const botSecretsRef = () => db.collection("stores").doc(STORE_ID).collection("botSecrets").doc(BOT_ID);
 const now = () => FieldValue.serverTimestamp();
 
@@ -275,12 +276,23 @@ async function readBotSecrets() {
   }
 }
 
+async function readStoreConfig() {
+  try {
+    const snap = await storeRef().get();
+    return snap.exists ? snap.data() : {};
+  } catch (e) {
+    console.error("store config read failed:", e.message);
+    return {};
+  }
+}
+
 module.exports = {
   admin,
   db,
   FieldValue,
   STORE_ID,
   BOT_ID,
+  storeRef,
   botRef,
   botSecretsRef,
   phoneFromJid,
@@ -297,4 +309,5 @@ module.exports = {
   logEvent,
   setConnectionState,
   readBotSecrets,
+  readStoreConfig,
 };

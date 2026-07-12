@@ -18,10 +18,12 @@
 
 const fetch = require("node-fetch");
 const {
+  storeRef,
   botRef,
   botSecretsRef,
   queueAiReply,
   readBotSecrets,
+  readStoreConfig,
   markIncomingAiDone,
   markIncomingAiError,
   logEvent,
@@ -54,36 +56,61 @@ let botConfig = {
   humanHandoffTrigger: "",
 };
 
-function mergeConfig(d = {}, secrets = {}) {
+function asArray(value) {
+  return Array.isArray(value) ? value.filter(Boolean) : [];
+}
+
+function textValue(...values) {
+  for (const value of values) {
+    const text = String(value || "").trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function mergeConfig(d = {}, secrets = {}, store = {}) {
   const previousGroqKey = botConfig.groqApiKey || process.env.GROQ_API_KEY || "";
+  const storeName = textValue(store.name, store.storeName, store.slug, "المتجر");
+  const defaultPersona = `أنت مساعد ذكي لمتجر ${storeName}. رد بلغة العميل باختصار ووضوح، واعتمد فقط على معلومات المتجر المحفوظة.`;
   botConfig = {
-    greeting: d.greeting || "",
-    closedMessage: d.closedMessage || d.offHoursMessage || "",
-    fallbackMessage: d.fallbackMessage || "عذراً، لم أفهم طلبك.",
-    isOpen: d.isOpen !== false && d.active !== false,
-    persona: d.persona || botConfig.persona,
-    systemInstructions: d.systemInstructions || "",
-    tone: d.tone || botConfig.tone,
-    rules: d.rules || [],
-    knowledge: d.knowledge || [],
-    products: d.products || [],
-    quickReplies: d.quickReplies || [],
-    faqs: d.faqs || [],
-    groqApiKey: secrets.groqApiKey || d.groqApiKey || previousGroqKey,
-    language: d.language || "ar",
+    greeting: textValue(d.greeting, store.greeting),
+    closedMessage: textValue(d.closedMessage, d.offHoursMessage, store.closedMessage, store.offHoursMessage),
+    fallbackMessage: textValue(d.fallbackMessage, store.fallbackMessage, "تم استلام رسالتك، وسنرد عليك قريباً."),
+    isOpen: d.isOpen !== false && d.active !== false && store.isOpen !== false,
+    persona: textValue(d.persona, store.persona, defaultPersona),
+    systemInstructions: textValue(d.systemInstructions, store.systemInstructions),
+    tone: textValue(d.tone, store.tone, botConfig.tone),
+    rules: asArray(d.rules).length ? asArray(d.rules) : asArray(store.rules),
+    knowledge: [...asArray(store.knowledge), ...asArray(d.knowledge)],
+    products: [...asArray(store.products), ...asArray(d.products)],
+    quickReplies: [...asArray(store.quickReplies), ...asArray(d.quickReplies)],
+    faqs: [...asArray(store.faqs), ...asArray(d.faqs)],
+    groqApiKey: textValue(secrets.groqApiKey, d.groqApiKey, store.groqApiKey, process.env.GROQ_API_KEY, previousGroqKey),
+    language: textValue(d.language, store.language, "ar"),
     temperature: typeof d.temperature === "number" ? Math.max(0, Math.min(1, d.temperature)) : botConfig.temperature,
     maxTokens: typeof d.maxTokens === "number" ? Math.max(80, Math.min(1200, d.maxTokens)) : botConfig.maxTokens,
-    workingHours: d.workingHours || null,
-    offHoursMessage: d.offHoursMessage || d.closedMessage || "",
-    humanHandoff: !!d.humanHandoff,
-    humanHandoffTrigger: d.humanHandoffTrigger || "",
+    workingHours: d.workingHours || store.workingHours || null,
+    offHoursMessage: textValue(d.offHoursMessage, d.closedMessage, store.offHoursMessage, store.closedMessage),
+    humanHandoff: !!(d.humanHandoff || store.humanHandoff),
+    humanHandoffTrigger: textValue(d.humanHandoffTrigger, store.humanHandoffTrigger),
   };
 }
 
 async function refreshConfig(d) {
-  const secrets = await readBotSecrets();
-  mergeConfig(d, secrets);
-  console.log("✓ إعدادات الذكاء محدّثة | Groq key:", botConfig.groqApiKey ? "موجود" : "غير موجود");
+  const [secrets, store] = await Promise.all([readBotSecrets(), readStoreConfig()]);
+  mergeConfig(d, secrets, store);
+  console.log(
+    "✓ إعدادات الذكاء محدّثة | Groq key:",
+    botConfig.groqApiKey ? "موجود" : "غير موجود",
+    "| معرفة:",
+    botConfig.knowledge.length,
+    "| منتجات:",
+    botConfig.products.length,
+    "| ردود:",
+    botConfig.quickReplies.length,
+    "| FAQ:",
+    botConfig.faqs.length,
+  );
 }
 
 botRef().onSnapshot(
@@ -95,11 +122,20 @@ botRef().onSnapshot(
 
 botSecretsRef().onSnapshot(
   async (snap) => {
-    const botSnap = await botRef().get();
-    mergeConfig(botSnap.exists ? botSnap.data() : {}, snap.exists ? snap.data() : {});
+    const [botSnap, store] = await Promise.all([botRef().get(), readStoreConfig()]);
+    mergeConfig(botSnap.exists ? botSnap.data() : {}, snap.exists ? snap.data() : {}, store);
     console.log("✓ أسرار البوت محدّثة | Groq key:", botConfig.groqApiKey ? "موجود" : "غير موجود");
   },
   (err) => console.error("botSecrets listener error:", err.message),
+);
+
+storeRef().onSnapshot(
+  async (snap) => {
+    const [botSnap, secrets] = await Promise.all([botRef().get(), readBotSecrets()]);
+    mergeConfig(botSnap.exists ? botSnap.data() : {}, secrets, snap.exists ? snap.data() : {});
+    console.log("✓ إعدادات المتجر محدّثة | Groq key:", botConfig.groqApiKey ? "موجود" : "غير موجود");
+  },
+  (err) => console.error("store listener error:", err.message),
 );
 
 // ============================================================
