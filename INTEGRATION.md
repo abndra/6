@@ -66,8 +66,8 @@ Restart أو Deploy في Railway ولا يظهر الهاتف كأنه سجّل 
 ### 2) المتغيرات في Railway → Variables
 | المتغير | القيمة |
 |---|---|
-| `APP_SUPABASE_URL` | رابط مشروع Supabase، مثال: `https://xxxxx.supabase.co` |
-| `APP_SUPABASE_SECRET_KEY` | المفتاح السري / service role من Supabase — ضعه في Railway فقط |
+| `APP_BACKEND_URL` | رابط الـ backend كما يظهر في لوحة تيسير |
+| `APP_BACKEND_PUBLISHABLE_KEY` | مفتاح النشر العام كما يظهر في لوحة تيسير — لا تحتاج مفتاحاً سرياً |
 | `TAYSIR_STORE_ID` | id المتجر (`stores/xxxx`) |
 | `TAYSIR_BOT_ID` | id البوت (`stores/xxx/bots/yyy`) |
 | `SERVICE_TOKEN` | (اختياري) نفس قيمة `railwayApiKey` في إعدادات البوت |
@@ -100,9 +100,9 @@ npm start
 1. `npm start` → امسح QR من لوحة المتجر (تبويب ربط واتساب).
 2. أرسل رسالة تجريبية لرقم البوت.
 3. بعد أول ربط انتظر ظهور `remoteSessionSaved=true` في حالة البوت؛ بعدها تستعاد الجلسة تلقائياً بعد أي Restart.
-4. راقب جدول `documents` في Supabase: ستظهر الرسالة في `conversations/*/messages`، ثم مهمة في
+4. راقب بيانات التطبيق: ستظهر الرسالة في `conversations/*/messages`، ثم مهمة في
    `aiQueue`، ثم رد في `outbox` بحالة `sent`.
 5. سيصل الرد إلى واتساب خلال ثوانٍ.
 
 ## ملاحظة أمنية
-لا ترفع `APP_SUPABASE_SECRET_KEY` إلى GitHub أبداً؛ ضعه فقط داخل Railway Variables.
+لا تضع أي مفتاح سري في GitHub. النسخة الحالية تعمل بمفتاح نشر عام مع `SERVICE_TOKEN` خاص بكل بوت.

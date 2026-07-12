@@ -11,8 +11,8 @@
 ## المتغيرات في Railway
 
 ```env
-APP_SUPABASE_URL=https://YOUR-PROJECT.supabase.co
-APP_SUPABASE_SECRET_KEY=ضع_مفتاح_Service_Role_أو_Secret_Key_من_Supabase
+APP_BACKEND_URL=https://YOUR-BACKEND-URL
+APP_BACKEND_PUBLISHABLE_KEY=ضع_مفتاح_النشر_العام_من_لوحة_تيسير
 SERVICE_TOKEN=نفس التوكن المحفوظ في لوحة تيسير
 GROQ_API_KEY=اختياري إذا كان محفوظاً داخل تيسير
 ```

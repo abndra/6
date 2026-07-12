@@ -5,7 +5,7 @@
   "description": "خادم واتساب (جسر) + عامل ذكاء Groq منفصل عبر Supabase",
   "main": "index.js",
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "scripts": {
     "start": "node index.js",
@@ -21,6 +21,7 @@
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
     "unzipper": "^0.10.11",
-    "whatsapp-web.js": "^1.26.0"
+    "whatsapp-web.js": "^1.26.0",
+    "ws": "^8.18.0"
   }
 }

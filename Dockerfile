@@ -2,7 +2,7 @@
 # Dockerfile — يثبّت Chromium وكل مكتبات النظام التي يحتاجها واتساب
 # هذا هو الحل الجذري لخطأ: libglib-2.0.so.0 cannot open shared object file
 # ============================================================
-FROM node:20-slim
+FROM node:22-slim
 
 # مكتبات النظام المطلوبة لتشغيل متصفح Chromium (whatsapp-web.js / puppeteer)
 RUN apt-get update && apt-get install -y --no-install-recommends \

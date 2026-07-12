@@ -1,7 +1,7 @@
 {
   "botName": "1",
-  "storeId": "cAGPFqAeV4PUjAPSzUOo",
-  "botId": "pJF4z28Y86j2ytbojUi0",
+  "storeId": "s82S7kUvElKFZr0Wo5XP",
+  "botId": "fvhaRT8cqFytzfimeAMN",
   "database": "supabase-documents",
   "filesVersion": "4.0.0",
   "filesVersionNote": "Supabase-only Railway package; no Firebase service account or Firestore variables required",
@@ -17,8 +17,8 @@
     "POST /reset-session"
   ],
   "requiredVariables": [
-    "APP_SUPABASE_URL",
-    "APP_SUPABASE_SECRET_KEY",
+    "APP_BACKEND_URL",
+    "APP_BACKEND_PUBLISHABLE_KEY",
     "SERVICE_TOKEN"
   ],
   "embeddedVariables": [

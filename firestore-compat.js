@@ -10,17 +10,30 @@
 // ============================================================
 
 const { createClient } = require("@supabase/supabase-js");
+const WebSocket = require("ws");
 
-const SUPABASE_URL = process.env.APP_SUPABASE_URL || process.env.SUPABASE_URL;
+const SUPABASE_URL =
+  process.env.APP_BACKEND_URL ||
+  process.env.APP_SUPABASE_URL ||
+  process.env.SUPABASE_URL;
 const SUPABASE_KEY =
+  process.env.APP_BACKEND_PUBLISHABLE_KEY ||
+  process.env.APP_SUPABASE_PUBLISHABLE_KEY ||
+  process.env.SUPABASE_PUBLISHABLE_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
   process.env.APP_SUPABASE_SECRET_KEY ||
   process.env.SUPABASE_SERVICE_ROLE_KEY ||
   process.env.SUPABASE_SECRET_KEY;
+const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "";
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   throw new Error(
-    "Supabase env missing: set APP_SUPABASE_URL و APP_SUPABASE_SECRET_KEY في Railway Variables",
+    "Backend env missing: set APP_BACKEND_URL و APP_BACKEND_PUBLISHABLE_KEY في Railway Variables",
   );
+}
+
+if (!SERVICE_TOKEN) {
+  throw new Error("SERVICE_TOKEN missing: ضعه في Railway بنفس القيمة المحفوظة داخل إعدادات البوت");
 }
 
 function makeFetch(key) {
@@ -33,6 +46,7 @@ function makeFetch(key) {
       headers.delete("Authorization");
     }
     headers.set("apikey", key);
+    headers.set("x-service-token", SERVICE_TOKEN);
     return fetch(input, { ...init, headers });
   };
 }
@@ -40,6 +54,10 @@ function makeFetch(key) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
   global: { fetch: makeFetch(SUPABASE_KEY) },
   auth: { persistSession: false, autoRefreshToken: false },
+  // Railway may run on Node versions without a built-in WebSocket implementation.
+  // Passing an explicit transport prevents Supabase Realtime from crashing before
+  // whatsapp-web.js has a chance to emit and save the QR/barcode.
+  realtime: { transport: WebSocket },
 });
 
 const TABLE = "documents";
