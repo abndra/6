@@ -19,12 +19,17 @@ const { Client, LocalAuth } = require("whatsapp-web.js");
 const qrcodeTerminal = require("qrcode-terminal");
 const QRCode = require("qrcode");
 const express = require("express");
+const fs = require("fs/promises");
+const path = require("path");
 const {
   admin,
+  STORE_ID,
+  BOT_ID,
   botRef,
   upsertCustomer,
   saveIncomingMessage,
   saveManualOutgoing,
+  queueOutgoingMessage,
   markOutboxSent,
   markOutboxError,
   logEvent,
@@ -47,11 +52,28 @@ const client = new Client({
 let latestQrRaw = null;
 let latestQrDataUrl = null;
 let connectionState = "disconnected";
+let lastError = null;
+const recentAutoSends = new Set();
 // وقت اكتمال الربط — نتجاهل أي رسالة أقدم منه حتى لا نستورد المحادثات القديمة.
 let readyAtSec = 0;
 
+function errorMessage(error) {
+  return String(error?.message || error || "unknown error").slice(0, 500);
+}
+
+process.on("unhandledRejection", (error) => {
+  lastError = errorMessage(error);
+  console.error("unhandledRejection:", lastError);
+});
+
+process.on("uncaughtException", (error) => {
+  lastError = errorMessage(error);
+  console.error("uncaughtException:", lastError);
+});
+
 
 client.on("qr", async (qr) => {
+  lastError = null;
   latestQrRaw = qr;
   connectionState = "qr";
   qrcodeTerminal.generate(qr, { small: true });
@@ -65,6 +87,7 @@ client.on("qr", async (qr) => {
 });
 
 client.on("ready", async () => {
+  lastError = null;
   connectionState = "connected";
   latestQrRaw = null;
   latestQrDataUrl = null;
@@ -83,12 +106,14 @@ client.on("ready", async () => {
 });
 
 client.on("auth_failure", async (m) => {
+  lastError = errorMessage(m || "auth_failure");
   connectionState = "disconnected";
   await logEvent("auth_failure", { message: String(m) });
   await setConnectionState({ connectionState: "disconnected", status: "pending", waConnected: false });
 });
 
 client.on("disconnected", async (reason) => {
+  lastError = errorMessage(reason || "disconnected");
   connectionState = "disconnected";
   await logEvent("disconnected", { reason });
   await setConnectionState({ connectionState: "disconnected", status: "pending", waConnected: false });
@@ -115,6 +140,8 @@ client.on("message_create", async (msg) => {
   if (!msg.fromMe) return;
   if (!/@c\.us$/.test(msg.to || "")) return;
   if (readyAtSec && Number(msg.timestamp) && Number(msg.timestamp) < readyAtSec) return;
+  const manualKey = `${String(msg.to || "").replace(/@.*/, "")}:${msg.body || ""}`;
+  if (recentAutoSends.has(manualKey)) return;
   try {
     await saveManualOutgoing(msg);
   } catch (e) {
@@ -122,7 +149,12 @@ client.on("message_create", async (msg) => {
   }
 });
 
-client.initialize();
+client.initialize().catch(async (error) => {
+  lastError = errorMessage(error);
+  connectionState = "init_error";
+  console.error("client.initialize failed:", lastError);
+  await setConnectionState({ connectionState: "init_error", status: "pending", waConnected: false, lastError }).catch(() => {});
+});
 
 // ============================================================
 // مراقبة طابور الإرسال (outbox) — إرسال أي رد جديد فوراً
@@ -156,6 +188,9 @@ async function sendOne(doc) {
     return;
   }
   try {
+    const autoKey = `${phone}:${text}`;
+    recentAutoSends.add(autoKey);
+    setTimeout(() => recentAutoSends.delete(autoKey), 30000).unref?.();
     await client.sendMessage(`${phone}@c.us`, text);
     await markOutboxSent(doc.id, phone, convMsgId);
     console.log(`→ أُرسلت رسالة إلى ${phone}`);
@@ -184,6 +219,18 @@ client.on("ready", async () => {
 // HTTP endpoints (للوحة المتجر: الحالة + QR + إعادة التهيئة)
 // ============================================================
 const app = express();
+
+// السماح للوحة تيسير (على دومين مختلف) بقراءة الحالة والـ QR من Railway.
+// بدون CORS سيظهر في اللوحة "غير متصل" حتى لو كان السيرفر يعمل فعلياً.
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Max-Age", "86400");
+  if (req.method === "OPTIONS") return res.status(204).end();
+  next();
+});
+
 app.use(express.json());
 
 function auth(req) {
@@ -192,21 +239,57 @@ function auth(req) {
   return h === `Bearer ${SERVICE_TOKEN}`;
 }
 
-app.get("/", (_req, res) => res.json({ ok: true, service: "whatsapp-bridge" }));
+app.get("/", (_req, res) => res.json({ ok: true, service: "whatsapp-bridge", storeId: STORE_ID, botId: BOT_ID }));
+
+app.get("/health", async (_req, res) => {
+  try {
+    await Promise.race([
+      botRef().get(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Firestore healthcheck timeout")), 8000)),
+    ]);
+    res.json({ ok: true, service: "whatsapp-bridge", firestore: true, storeId: STORE_ID, botId: BOT_ID, connectionState });
+  } catch (error) {
+    lastError = errorMessage(error);
+    res.status(500).json({ ok: false, service: "whatsapp-bridge", firestore: false, error: lastError, storeId: STORE_ID, botId: BOT_ID });
+  }
+});
 
 app.get("/status", (_req, res) => {
   res.json({
+    ok: true,
+    service: "whatsapp-bridge",
+    storeId: STORE_ID,
+    botId: BOT_ID,
     connectionState,
+    status: connectionState,
+    connection: connectionState,
     state: connectionState === "connected" ? "open" : connectionState,
     connected: connectionState === "connected",
     ready: connectionState === "connected",
     hasQr: !!latestQrRaw,
     qr: latestQrRaw,
     qrDataUrl: latestQrDataUrl,
+    lastError,
+    uptimeSec: Math.floor(process.uptime()),
+    serverTime: new Date().toISOString(),
   });
 });
 
 app.get("/qr", (_req, res) => res.json({ qr: latestQrRaw, qrDataUrl: latestQrDataUrl }));
+
+app.post("/send", async (req, res) => {
+  if (!auth(req)) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const phone = String(req.body?.phone || "").replace(/\D/g, "");
+    const text = String(req.body?.text || req.body?.message || "").trim();
+    if (!/^\d{8,15}$/.test(phone) || !text) return res.status(400).json({ ok: false, error: "phone/text required" });
+    const convMsgId = await queueOutgoingMessage(phone, text, { source: "api" });
+    res.json({ ok: true, queued: true, phone, convMsgId });
+  } catch (e) {
+    lastError = errorMessage(e);
+    res.status(500).json({ ok: false, error: lastError });
+  }
+});
 
 app.post("/logout", async (req, res) => {
   if (!auth(req)) return res.status(401).json({ error: "unauthorized" });
@@ -223,7 +306,26 @@ app.post("/logout", async (req, res) => {
 app.post("/restart", async (req, res) => {
   if (!auth(req)) return res.status(401).json({ error: "unauthorized" });
   res.json({ ok: true });
-  setTimeout(() => process.exit(0), 300); // Railway يعيد التشغيل تلقائياً
+  setTimeout(() => process.exit(1), 300); // Railway يعيد التشغيل تلقائياً عبر restartPolicy
+});
+
+app.post("/reset-session", async (req, res) => {
+  if (!auth(req)) return res.status(401).json({ error: "unauthorized" });
+  try {
+    await client.destroy().catch(() => {});
+    await fs.rm(path.resolve("./.wwebjs_auth"), { recursive: true, force: true });
+    await fs.rm(path.resolve("./.wwebjs_cache"), { recursive: true, force: true });
+    latestQrRaw = null;
+    latestQrDataUrl = null;
+    connectionState = "resetting";
+    lastError = null;
+    await setConnectionState({ connectionState: "resetting", status: "pending", waConnected: false, lastQr: null });
+    res.json({ ok: true, restarting: true });
+    setTimeout(() => process.exit(1), 300); // Railway يعيد التشغيل ويولد QR جديد
+  } catch (e) {
+    lastError = errorMessage(e);
+    res.status(500).json({ error: lastError });
+  }
 });
 
 const port = process.env.PORT || 3000;

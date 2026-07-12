@@ -53,6 +53,7 @@ if (!STORE_ID || !BOT_ID) {
 
 
 const botRef = () => db.collection("stores").doc(STORE_ID).collection("bots").doc(BOT_ID);
+const botSecretsRef = () => db.collection("stores").doc(STORE_ID).collection("botSecrets").doc(BOT_ID);
 const now = () => FieldValue.serverTimestamp();
 
 // ---- أدوات مساعدة ----
@@ -147,6 +148,28 @@ async function saveIncomingMessage(msg) {
   return { phone, name, body, msgId: msgDoc.id };
 }
 
+async function markIncomingAiDone(phone, msgId, patch = {}) {
+  if (!phone || !msgId) return;
+  await botRef()
+    .collection("conversations")
+    .doc(phone)
+    .collection("messages")
+    .doc(msgId)
+    .set({ aiStatus: "done", ...patch }, { merge: true })
+    .catch(() => {});
+}
+
+async function markIncomingAiError(phone, msgId, message) {
+  if (!phone || !msgId) return;
+  await botRef()
+    .collection("conversations")
+    .doc(phone)
+    .collection("messages")
+    .doc(msgId)
+    .set({ aiStatus: "error", aiError: String(message || "").slice(0, 300) }, { merge: true })
+    .catch(() => {});
+}
+
 // ============================================================
 // 3) حفظ رسالة صادرة يدوية (من الهاتف نفسه) — للعرض فقط
 // ============================================================
@@ -170,6 +193,10 @@ async function saveManualOutgoing(msg) {
 // 4) عامل الذكاء: كتابة الرد في المحادثة + وضعه في طابور الإرسال
 // ============================================================
 async function queueAiReply(phone, text, { source = "ai" } = {}) {
+  return queueOutgoingMessage(phone, text, { source });
+}
+
+async function queueOutgoingMessage(phone, text, { source = "api" } = {}) {
   const convRef = botRef().collection("conversations").doc(phone);
 
   // 4.a) الرسالة الصادرة داخل المحادثة (تظهر فوراً في اللوحة)
@@ -240,7 +267,7 @@ async function setConnectionState(patch) {
 // ============================================================
 async function readBotSecrets() {
   try {
-    const snap = await db.collection("stores").doc(STORE_ID).collection("botSecrets").doc(BOT_ID).get();
+    const snap = await botSecretsRef().get();
     return snap.exists ? snap.data() : {};
   } catch (e) {
     console.error("botSecrets read failed:", e.message);
@@ -255,12 +282,16 @@ module.exports = {
   STORE_ID,
   BOT_ID,
   botRef,
+  botSecretsRef,
   phoneFromJid,
   isRealCustomer,
   upsertCustomer,
   saveIncomingMessage,
   saveManualOutgoing,
   queueAiReply,
+  queueOutgoingMessage,
+  markIncomingAiDone,
+  markIncomingAiError,
   markOutboxSent,
   markOutboxError,
   logEvent,

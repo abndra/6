@@ -4,9 +4,11 @@
   "botId": "sF8d1BUjlJGEqZlUSN22",
   "firestoreDatabaseId": "default",
   "filesVersion": "3.0.0",
+  "filesVersionNote": "Groq key live listener + Firestore aiQueue/outbox recovery",
   "architecture": "whatsapp-bridge + firestore aiQueue/outbox + groq ai-worker",
   "messages": "الرسائل الجديدة فقط بعد الربط — لا استيراد للمحادثات القديمة",
   "endpoints": [
+    "GET /health",
     "GET /status",
     "GET /qr",
     "POST /send",

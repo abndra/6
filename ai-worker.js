@@ -19,12 +19,16 @@
 const fetch = require("node-fetch");
 const {
   botRef,
+  botSecretsRef,
   queueAiReply,
   readBotSecrets,
+  markIncomingAiDone,
+  markIncomingAiError,
   logEvent,
 } = require("./firestore-writer");
 
 const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+const STALE_PROCESSING_MS = Number(process.env.AI_STALE_PROCESSING_MS || 120000);
 
 // ---- إعدادات البوت الحيّة (تُحدّث لحظياً من Firestore) ----
 let botConfig = {
@@ -33,29 +37,52 @@ let botConfig = {
   fallbackMessage: "تم استلام رسالتك، وسنرد عليك قريباً.",
   isOpen: true,
   persona: "أنت مساعد ودود في متجر إلكتروني. رد باللغة العربية بشكل قصير ومفيد.",
+  systemInstructions: "",
+  tone: "ودود ومحترف",
   rules: [],
   knowledge: [],
+  products: [],
   quickReplies: [],
   faqs: [],
   groqApiKey: process.env.GROQ_API_KEY || "",
   language: "ar",
+  temperature: 0.4,
+  maxTokens: 350,
+  workingHours: null,
+  offHoursMessage: "",
+  humanHandoff: false,
+  humanHandoffTrigger: "",
 };
+
+function mergeConfig(d = {}, secrets = {}) {
+  const previousGroqKey = botConfig.groqApiKey || process.env.GROQ_API_KEY || "";
+  botConfig = {
+    greeting: d.greeting || "",
+    closedMessage: d.closedMessage || d.offHoursMessage || "",
+    fallbackMessage: d.fallbackMessage || "عذراً، لم أفهم طلبك.",
+    isOpen: d.isOpen !== false && d.active !== false,
+    persona: d.persona || botConfig.persona,
+    systemInstructions: d.systemInstructions || "",
+    tone: d.tone || botConfig.tone,
+    rules: d.rules || [],
+    knowledge: d.knowledge || [],
+    products: d.products || [],
+    quickReplies: d.quickReplies || [],
+    faqs: d.faqs || [],
+    groqApiKey: secrets.groqApiKey || d.groqApiKey || previousGroqKey,
+    language: d.language || "ar",
+    temperature: typeof d.temperature === "number" ? Math.max(0, Math.min(1, d.temperature)) : botConfig.temperature,
+    maxTokens: typeof d.maxTokens === "number" ? Math.max(80, Math.min(1200, d.maxTokens)) : botConfig.maxTokens,
+    workingHours: d.workingHours || null,
+    offHoursMessage: d.offHoursMessage || d.closedMessage || "",
+    humanHandoff: !!d.humanHandoff,
+    humanHandoffTrigger: d.humanHandoffTrigger || "",
+  };
+}
 
 async function refreshConfig(d) {
   const secrets = await readBotSecrets();
-  botConfig = {
-    greeting: d.greeting || "",
-    closedMessage: d.closedMessage || "",
-    fallbackMessage: d.fallbackMessage || "عذراً، لم أفهم طلبك.",
-    isOpen: d.isOpen !== false,
-    persona: d.persona || botConfig.persona,
-    rules: d.rules || [],
-    knowledge: d.knowledge || [],
-    quickReplies: d.quickReplies || [],
-    faqs: d.faqs || [],
-    groqApiKey: secrets.groqApiKey || d.groqApiKey || process.env.GROQ_API_KEY || "",
-    language: d.language || "ar",
-  };
+  mergeConfig(d, secrets);
   console.log("✓ إعدادات الذكاء محدّثة | Groq key:", botConfig.groqApiKey ? "موجود" : "غير موجود");
 }
 
@@ -64,6 +91,15 @@ botRef().onSnapshot(
     if (snap.exists) refreshConfig(snap.data()).catch((e) => console.error("refreshConfig:", e.message));
   },
   (err) => console.error("config listener error:", err.message),
+);
+
+botSecretsRef().onSnapshot(
+  async (snap) => {
+    const botSnap = await botRef().get();
+    mergeConfig(botSnap.exists ? botSnap.data() : {}, snap.exists ? snap.data() : {});
+    console.log("✓ أسرار البوت محدّثة | Groq key:", botConfig.groqApiKey ? "موجود" : "غير موجود");
+  },
+  (err) => console.error("botSecrets listener error:", err.message),
 );
 
 // ============================================================
@@ -111,16 +147,45 @@ function instantMatch(text) {
   return null;
 }
 
+function shouldHandOffToHuman(text) {
+  if (!botConfig.humanHandoff || !botConfig.humanHandoffTrigger) return false;
+  return normalize(text).includes(normalize(botConfig.humanHandoffTrigger));
+}
+
+function isWithinWorkingHours() {
+  const wh = botConfig.workingHours;
+  if (!wh?.enabled || !wh.from || !wh.to) return true;
+  try {
+    const timezone = wh.timezone || "Asia/Muscat";
+    const formatter = new Intl.DateTimeFormat("en-GB", { timeZone: timezone, hour: "2-digit", minute: "2-digit", hour12: false });
+    const parts = Object.fromEntries(formatter.formatToParts(new Date()).map((p) => [p.type, p.value]));
+    const nowMinutes = Number(parts.hour) * 60 + Number(parts.minute);
+    const [fromHour, fromMinute] = String(wh.from).split(":").map(Number);
+    const [toHour, toMinute] = String(wh.to).split(":").map(Number);
+    const fromMinutes = fromHour * 60 + fromMinute;
+    const toMinutes = toHour * 60 + toMinute;
+    if (fromMinutes <= toMinutes) return nowMinutes >= fromMinutes && nowMinutes <= toMinutes;
+    return nowMinutes >= fromMinutes || nowMinutes <= toMinutes;
+  } catch {
+    return true;
+  }
+}
+
 // ============================================================
 // بناء system prompt من كل ما تعلّمه المستخدم
 // ============================================================
 function buildSystemPrompt() {
   const parts = [botConfig.persona];
+  if (botConfig.systemInstructions) parts.push("\n=== تعليمات النظام ===\n" + botConfig.systemInstructions);
+  if (botConfig.tone) parts.push(`\n=== النبرة ===\n${botConfig.tone}`);
   if (botConfig.rules.length) {
     parts.push("\n=== قوانين يجب الالتزام بها ===\n" + botConfig.rules.map((r, i) => `${i + 1}. ${r}`).join("\n"));
   }
   if (botConfig.knowledge.length) {
     parts.push("\n=== قاعدة معرفة المتجر ===\n" + botConfig.knowledge.map((k) => `• ${k.title}: ${k.content}`).join("\n"));
+  }
+  if (botConfig.products.length) {
+    parts.push("\n=== المنتجات والأسعار ===\n" + botConfig.products.map((p) => `• ${p.name}${p.price ? ` (${p.price})` : ""}: ${p.description || ""}`).join("\n"));
   }
   if (botConfig.faqs.length) {
     parts.push("\n=== أسئلة شائعة ===\n" + botConfig.faqs.map((f) => `س: ${f.q}\nج: ${f.a}`).join("\n"));
@@ -143,8 +208,8 @@ async function askGroq(userMessage, history = []) {
         ...history.slice(-6),
         { role: "user", content: userMessage },
       ],
-      temperature: 0.6,
-      max_tokens: 450,
+      temperature: botConfig.temperature,
+      max_tokens: botConfig.maxTokens,
     }),
   });
   if (!res.ok) throw new Error(`Groq ${res.status}: ${await res.text()}`);
@@ -181,13 +246,25 @@ async function isFirstMessage(phone) {
 // ============================================================
 // معالجة رسالة واحدة من الطابور
 // ============================================================
-async function processJob(phone, body) {
+async function processJob(phone, body, msgId) {
   const text = (body || "").trim();
   if (!text) return;
 
-  // 1) المتجر مغلق
+  if (shouldHandOffToHuman(text)) {
+    await logEvent("human_handoff", { phone, msgId });
+    await markIncomingAiDone(phone, msgId, { aiResponse: null, aiSource: "human_handoff" });
+    return;
+  }
+
+  // 1) المتجر/البوت مغلق أو خارج ساعات العمل
   if (!botConfig.isOpen && botConfig.closedMessage) {
     await queueAiReply(phone, botConfig.closedMessage, { source: "closed" });
+    await markIncomingAiDone(phone, msgId, { aiResponse: botConfig.closedMessage, aiSource: "closed" });
+    return;
+  }
+  if (!isWithinWorkingHours() && botConfig.offHoursMessage) {
+    await queueAiReply(phone, botConfig.offHoursMessage, { source: "closed" });
+    await markIncomingAiDone(phone, msgId, { aiResponse: botConfig.offHoursMessage, aiSource: "closed" });
     return;
   }
 
@@ -200,6 +277,7 @@ async function processJob(phone, body) {
   const instant = instantMatch(text);
   if (instant) {
     await queueAiReply(phone, instant, { source: "instant" });
+    await markIncomingAiDone(phone, msgId, { aiResponse: instant, aiSource: "instant" });
     return;
   }
 
@@ -207,11 +285,14 @@ async function processJob(phone, body) {
   try {
     const history = await loadHistory(phone);
     const reply = await askGroq(text, history);
-    await queueAiReply(phone, reply || botConfig.fallbackMessage, { source: "groq" });
+    const finalReply = reply || botConfig.fallbackMessage;
+    await queueAiReply(phone, finalReply, { source: "groq" });
+    await markIncomingAiDone(phone, msgId, { aiResponse: finalReply, aiSource: "groq", aiModel: GROQ_MODEL });
   } catch (e) {
     console.error("Groq failed:", e.message);
     await logEvent("groq_error", { phone, message: e.message });
     await queueAiReply(phone, botConfig.fallbackMessage, { source: "fallback" });
+    await markIncomingAiError(phone, msgId, e.message);
   }
 }
 
@@ -254,9 +335,9 @@ async function handleQueueDoc(doc) {
   }
   if (!claimed) return;
 
-  const { phone, body } = doc.data() || {};
+  const { phone, body, msgId } = doc.data() || {};
   try {
-    await processJob(phone, body);
+    await processJob(phone, body, msgId);
     await ref.set({ status: "done", doneAt: new Date() }, { merge: true });
   } catch (e) {
     console.error("processJob error:", e.message);
@@ -274,6 +355,14 @@ console.log("🤖 عامل الذكاء (Groq) يعمل ويستمع لطابو�
       if (processing.has(d.id)) return;
       processing.add(d.id);
       handleQueueDoc(d).finally(() => processing.delete(d.id));
+    });
+    const stuck = await botRef().collection("aiQueue").where("status", "==", "processing").get();
+    const cutoff = Date.now() - STALE_PROCESSING_MS;
+    stuck.forEach((d) => {
+      const claimed = d.data().claimedAt;
+      const claimedMs = typeof claimed?.toMillis === "function" ? claimed.toMillis() : claimed instanceof Date ? claimed.getTime() : 0;
+      if (claimedMs && claimedMs > cutoff) return;
+      d.ref.set({ status: "pending", recoveredAt: new Date() }, { merge: true }).catch((e) => console.error("recover stuck job:", e.message));
     });
   } catch (e) {
     console.error("startup drain error:", e.message);
