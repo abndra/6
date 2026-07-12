@@ -1,35 +1,31 @@
-# 6
+# 1
 
-ملفات سيرفر واتساب الجديدة للرفع على GitHub ثم Railway.
+خادم واتساب لتيسير — يُرفع إلى GitHub ثم يُنشر على Railway عبر Docker.
 
-البنية: واتساب يستقبل ويحفظ في Firestore، عامل الذكاء يقرأ `aiQueue` ويكتب الرد في `outbox`، ثم واتساب يرسل الرد فوراً.
+البنية: واتساب يستقبل **الرسائل الجديدة فقط** ويحفظها في Firestore، عامل الذكاء يقرأ `aiQueue`
+ويكتب الرد في `outbox`، ثم واتساب يرسله فوراً. لا يتم استيراد أي محادثات قديمة.
 
-## Railway Variables
+## المتغيرات في Railway
 
 ```env
-SERVICE_TOKEN=نفس التوكن الذي تحفظه في لوحة تيسير
-GROQ_API_KEY=اختياري إذا كان مفتاح Groq محفوظاً داخل إعدادات البوت
-BOT_NAME=6
-GROQ_MODEL=llama-3.3-70b-versatile
 FIREBASE_SERVICE_ACCOUNT=الصق JSON كامل
-# اختياريان الآن إذا حمّلت ZIP بعد حفظ البوت؛ القيم موجودة داخل bot.config.json
-TAYSIR_STORE_ID=zj4KW4k2kiInawdlofxD
-TAYSIR_BOT_ID=6fZIB8yfDE2QCzn21JKM
+FIRESTORE_DATABASE_ID=default
+SERVICE_TOKEN=نفس التوكن المحفوظ في لوحة تيسير
+GROQ_API_KEY=اختياري إذا كان محفوظاً داخل تيسير
 ```
 
-## التشغيل
+> `TAYSIR_STORE_ID` و`TAYSIR_BOT_ID` موجودان تلقائياً داخل `bot.config.json`،
+> لذا لا حاجة لإضافتهما في Railway طالما حمّلت هذه الملفات بعد حفظ البوت.
+
+## النشر
 
 1. ارفع كل الملفات كما هي إلى GitHub.
-2. اربط المستودع مع Railway.
-3. تأكد أن Start command هو `npm start`.
-4. بعد النشر انسخ رابط Railway وضعه في لوحة تيسير مع نفس `SERVICE_TOKEN`.
-5. اضغط فحص الحالة / تحديث QR ثم امسح الباركود من واتساب.
+2. اربط المستودع مع Railway (سيكتشف `Dockerfile` تلقائياً).
+3. أضِف المتغيرات أعلاه ثم Deploy.
+4. انسخ رابط Railway وضعه في لوحة تيسير مع نفس `SERVICE_TOKEN`.
+5. اضغط فحص الحالة / تحديث QR ثم امسح الباركود.
 
-## Endpoints
+## لماذا Docker؟
 
-- `GET /status` يعرض الحالة والـ QR.
-- `GET /qr` يعرض QR فقط.
-- `POST /send` يرسل رسالة واتساب يدوياً.
-- `POST /restart` يعيد تشغيل جلسة واتساب.
-- `POST /logout` يصفّر جلسة واتساب.
-- `POST /reset-session` يعيد تشغيل جلسة الربط.
+لأن واتساب يشغّل متصفح Chromium الذي يحتاج مكتبات نظام (مثل libglib).
+ملف `Dockerfile` يثبّتها تلقائياً، فلا يتعطّل النشر مثل بيئة Nixpacks الافتراضية.
