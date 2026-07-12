@@ -1,98 +1,97 @@
-# ربط سيرفر Railway بقاعدة بيانات تيسير — خطوات نهائية
+# خادم Railway لتيسير — بنية مفصولة (واتساب ⇄ Firestore ⇄ ذكاء Groq)
 
-## لماذا لا تظهر الرسائل الآن؟
+## الفكرة الجوهرية
 
-صفحة المتجر (العملاء + الوارد) تقرأ من Firestore مباشرة عبر `onSnapshot`.
-سيرفر Railway (whatsapp-web.js) يستقبل الرسائل من واتساب لكنه **لا يكتبها في
-Firestore**، لذلك تبقى الصفحة فارغة.
+النظام مقسوم إلى وحدتين **منفصلتين تماماً**، لا يعرف أحدهما الآخر، ويتواصلان فقط
+عبر Firestore. هذا يجعل النظام سريعاً جداً وموثوقاً: لو تعطّل الذكاء، تبقى
+الرسائل محفوظة؛ ولو تعطّل الإرسال، لا يضيع أي رد.
 
-الحل النهائي: نجعل السيرفر يكتب كل رسالة/عميل/حدث فور استلامه.
+```
+                    ┌──────────────────────────────┐
+   رسالة واتساب  →  │  server.js  (خادم واتساب)      │
+                    │  • يستقبل الرسالة              │
+                    │  • يحفظها فوراً في Firestore    │ ── (لا يعرف Groq إطلاقاً)
+                    │  • يراقب outbox ويرسل أي رد    │
+                    └──────────────┬───────────────┘
+                                   │  Firestore
+             aiQueue (وارد) ↓      │      ↑ outbox (صادر)
+                    ┌──────────────┴───────────────┐
+                    │  ai-worker.js (عامل الذكاء)   │
+                    │  • يقرأ الرسالة من aiQueue     │ ── (لا يعرف واتساب إطلاقاً)
+                    │  • يبحث في المعرفة/الأسئلة     │
+                    │  • إن لم يجد → يرد عبر Groq    │
+                    │  • يكتب الرد في outbox         │
+                    └──────────────────────────────┘
+```
+
+### تدفّق رسالة واحدة (خطوة بخطوة)
+1. عميل يرسل «مرحبا» إلى رقم البوت.
+2. `server.js` يستقبلها ويحفظها فوراً في:
+   `stores/{storeId}/bots/{botId}/conversations/{phone}/messages`
+   ويضيف مهمة في `.../aiQueue` بحالة `pending`.
+3. `ai-worker.js` يسمع `aiQueue` لحظياً (`onSnapshot`)، يقرأ الرسالة:
+   - يبحث في **الردود الجاهزة** و**الأسئلة الشائعة** → إن وُجد تطابق، يرد فوراً بدون Groq.
+   - وإلا يستدعي **Groq** بمفتاح البوت الخاص مع قاعدة المعرفة والقوانين كسياق.
+4. يكتب الرد في المحادثة ويضيفه إلى `.../outbox` بحالة `pending`.
+5. `server.js` يسمع `outbox` لحظياً، يلتقط الرد ويرسله للرقم، ثم يعلّمه `sent`.
+
+كل خطوة تعتمد `onSnapshot` (دفع فوري) — لا انتظار ولا استعلام دوري = سرعة قصوى.
 
 ---
 
-## الخطوات (5 دقائق)
+## ملفات المستودع
 
-### 1) توليد مفتاح Service Account
+| الملف | الدور |
+|---|---|
+| `index.js` | مُشغّل واحد يشغّل الوحدتين معاً (أمر البدء الافتراضي). |
+| `server.js` | خادم واتساب: استقبال + حفظ + إرسال. **بدون أي ذكاء.** |
+| `ai-worker.js` | عامل Groq: قراءة + تحليل + رد. **بدون أي واتساب.** |
+| `firestore-writer.js` | طبقة البيانات المشتركة (كل القراءة/الكتابة في Firestore). |
+| `package.json` / `Procfile` | إعداد النشر. |
+
+---
+
+## خطوات النشر على Railway (5 دقائق)
+
+### 1) مفتاح Service Account
 Firebase Console → ⚙️ Project Settings → **Service accounts** →
-**Generate new private key** → سيتنزل ملف JSON.
+**Generate new private key** → ينزل ملف JSON.
 
-### 2) إضافة المتغيرات في Railway
-في Railway → مشروع البوت → **Variables** أضف:
-
+### 2) المتغيرات في Railway → Variables
 | المتغير | القيمة |
 |---|---|
-| `FIREBASE_SERVICE_ACCOUNT` | الصق **محتوى ملف JSON كاملاً** (سطر واحد) |
-| `TAYSIR_STORE_ID` | id المتجر من Firestore (`stores/xxxxxx`) |
+| `FIREBASE_SERVICE_ACCOUNT` | الصق **محتوى ملف JSON كاملاً** |
+| `TAYSIR_STORE_ID` | id المتجر (`stores/xxxx`) |
 | `TAYSIR_BOT_ID` | id البوت (`stores/xxx/bots/yyy`) |
+| `SERVICE_TOKEN` | (اختياري) نفس قيمة `railwayApiKey` في إعدادات البوت |
+| `GROQ_API_KEY` | (اختياري) احتياطي فقط — الأساس أن يُقرأ لكل بوت من إعداداته |
 
-### 3) تثبيت المكتبة في مستودع Railway
+> مفتاح Groq لكل بوت يُقرأ تلقائياً من Firestore
+> (`botSecrets/{botId}.groqApiKey` أو `bots/{botId}.groqApiKey`)، لذا كل بوت
+> يعمل بمفتاحه الخاص دون لمس متغيرات Railway.
+
+### 3) النشر
+ارفع محتوى مجلد `railway-server` إلى مستودع Railway ثم:
 ```bash
-npm install firebase-admin
+npm install
+npm start
 ```
 
-### 4) انسخ `firestore-writer.js` إلى جذر مستودع Railway
-هو الملف الموجود بجانب هذا الدليل.
-
-### 5) استخدمه في ملف البوت الرئيسي (`index.js` أو ما شابه)
-```js
-const { Client } = require("whatsapp-web.js");
-const {
-  upsertCustomer,
-  saveMessage,
-  logEvent,
-  saveAiReply,
-} = require("./firestore-writer");
-
-const client = new Client({ /* ... إعداداتك ... */ });
-
-client.on("qr", (qr) => logEvent("qr", { qr }));
-client.on("ready", () => logEvent("connected"));
-client.on("disconnected", (r) => logEvent("disconnected", { reason: r }));
-
-// ✅ كل رسالة واردة → Firestore
-client.on("message", async (msg) => {
-  try {
-    await upsertCustomer(msg);
-    await saveMessage(msg);
-
-    // ... منطق الرد بـ Groq الحالي ...
-    // const reply = await askGroq(msg.body);
-    // await msg.reply(reply);
-    // await saveAiReply(msg.from, reply);
-  } catch (e) {
-    console.error("firestore write failed:", e);
-    await logEvent("error", { message: e.message });
-  }
-});
-
-// ✅ كل رسالة صادرة يدوياً → Firestore أيضاً
-client.on("message_create", async (msg) => {
-  if (!msg.fromMe) return;
-  try {
-    await upsertCustomer(msg);
-    await saveMessage(msg);
-  } catch (e) {
-    console.error(e);
-  }
-});
-
-client.initialize();
-```
-
-### 6) أعد نشر السيرفر على Railway
-بمجرد إعادة النشر → أرسل رسالة تجريبية لرقم البوت →
-ستظهر فوراً في تبويب **الوارد** و**العملاء** في لوحة تيسير.
+### طريقتان للتشغيل
+- **الأبسط (خدمة واحدة):** `npm start` — يشغّل الوحدتين معاً في عملية واحدة،
+  لكنهما تبقيان منفصلتين في الكود عبر Firestore.
+- **خدمتان منفصلتان (فصل كامل):** خدمة بـ `npm run start:bridge` وأخرى بـ
+  `npm run start:ai`. الاثنتان تقرآن نفس متغيرات البيئة.
 
 ---
 
-## كيف تعرف أنها تعمل؟
-
-1. افتح Firebase Console → Firestore → تصفّح:
-   `stores/{STORE_ID}/bots/{BOT_ID}/conversations`
-   يجب أن ترى وثائق بأرقام واتساب.
-2. افتح `.../events` — ستجد سجل `connected`, `qr`, إلخ.
-3. صفحة المتجر → **الوارد** → تظهر المحادثات لحظياً.
+## كيف تتأكد أنه يعمل؟
+1. `npm start` → امسح QR من لوحة المتجر (تبويب ربط واتساب).
+2. أرسل رسالة تجريبية لرقم البوت.
+3. راقب Firestore: ستظهر الرسالة في `conversations/*/messages`، ثم مهمة في
+   `aiQueue`، ثم رد في `outbox` بحالة `sent`.
+4. سيصل الرد إلى واتساب خلال ثوانٍ.
 
 ## ملاحظة أمنية
-`FIREBASE_SERVICE_ACCOUNT` صلاحيته كاملة على قاعدة البيانات ويتخطى قواعد
-الأمان — احتفظ به في Railway Variables فقط، لا ترفعه إلى git أبداً.
+`FIREBASE_SERVICE_ACCOUNT` صلاحيته كاملة ويتخطى قواعد الأمان — احتفظ به في
+Railway Variables فقط، ولا ترفعه إلى git أبداً.

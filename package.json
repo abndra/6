@@ -1,23 +1,23 @@
 {
-  "name": "taysir-whatsapp-server",
-  "version": "1.0.0",
+  "name": "taysir-railway-server",
+  "version": "2.0.0",
   "private": true,
-  "type": "module",
+  "description": "خادم واتساب (جسر) + عامل ذكاء Groq منفصل عبر Firestore",
+  "main": "index.js",
   "engines": {
-    "node": ">=20"
+    "node": ">=18"
   },
   "scripts": {
-    "start": "node server.js"
+    "start": "node index.js",
+    "start:bridge": "node server.js",
+    "start:ai": "node ai-worker.js"
   },
   "dependencies": {
-    "@hapi/boom": "^10.0.1",
-    "@whiskeysockets/baileys": "6.7.22",
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.7",
-    "express": "^4.18.3",
-    "firebase-admin": "^12.6.0",
-    "pino": "^9.6.0",
-    "qrcode": "^1.5.4"
-  },
-  "devDependencies": {}
+    "express": "^4.19.2",
+    "firebase-admin": "^12.7.0",
+    "node-fetch": "^2.7.0",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.26.0"
+  }
 }
