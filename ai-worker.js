@@ -32,12 +32,13 @@ const {
 
 const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 const STALE_PROCESSING_MS = Number(process.env.AI_STALE_PROCESSING_MS || 120000);
-const AI_POLL_INTERVAL_MS = Math.max(30000, Number(process.env.AI_POLL_INTERVAL_MS || 60000));
-const AI_RECOVER_INTERVAL_MS = Math.max(120000, Number(process.env.AI_RECOVER_INTERVAL_MS || 300000));
-const AI_GROQ_TIMEOUT_MS = Math.max(10000, Number(process.env.AI_GROQ_TIMEOUT_MS || 30000));
-const AI_MAX_CONCURRENT = Math.max(1, Math.min(5, Number(process.env.AI_MAX_CONCURRENT || 2)));
-const AI_CONFIG_REFRESH_MS = Math.max(60000, Number(process.env.AI_CONFIG_REFRESH_MS || 600000));
-const AI_HEARTBEAT_WRITE_MS = Math.max(60000, Number(process.env.AI_HEARTBEAT_WRITE_MS || 300000));
+// السرعة أولاً: الحد الأدنى منخفض جداً بحيث onSnapshot يعمل فوراً و polling يكمل بسرعة كشبكة أمان
+const AI_POLL_INTERVAL_MS = Math.max(1000, Number(process.env.AI_POLL_INTERVAL_MS || 2000));
+const AI_RECOVER_INTERVAL_MS = Math.max(15000, Number(process.env.AI_RECOVER_INTERVAL_MS || 30000));
+const AI_GROQ_TIMEOUT_MS = Math.max(5000, Number(process.env.AI_GROQ_TIMEOUT_MS || 25000));
+const AI_MAX_CONCURRENT = Math.max(1, Math.min(10, Number(process.env.AI_MAX_CONCURRENT || 5)));
+const AI_CONFIG_REFRESH_MS = Math.max(15000, Number(process.env.AI_CONFIG_REFRESH_MS || 60000));
+const AI_HEARTBEAT_WRITE_MS = Math.max(30000, Number(process.env.AI_HEARTBEAT_WRITE_MS || 120000));
 
 // ---- إعدادات البوت الحيّة (تُحدّث دورياً من Supabase) ----
 let botConfig = {

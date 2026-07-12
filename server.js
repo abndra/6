@@ -47,7 +47,7 @@ const NEW_MESSAGE_GRACE_SEC = Number(process.env.NEW_MESSAGE_GRACE_SEC || 45);
 // خمس دقائق كافية لحفظ الجلسة باستمرار وتمنع OOM على خطط Railway الصغيرة.
 const REMOTE_SESSION_BACKUP_MS = Math.max(60000, Number(process.env.REMOTE_SESSION_BACKUP_MS || 300000));
 const REMOTE_SESSION_CLIENT_ID = String(process.env.REMOTE_SESSION_CLIENT_ID || `${STORE_ID}_${BOT_ID}`).replace(/[^a-z0-9_-]/gi, "_");
-const OUTBOX_POLL_INTERVAL_MS = Math.max(15000, Number(process.env.OUTBOX_POLL_INTERVAL_MS || 30000));
+const OUTBOX_POLL_INTERVAL_MS = Math.max(1000, Number(process.env.OUTBOX_POLL_INTERVAL_MS || 2000));
 // getChats/fetchMessages يحمّل بيانات كثيرة من واتساب. نجعله شبكة أمان خفيفة فقط، لا فحصاً كل 30 ثانية.
 const MESSAGE_SWEEP_ENABLED = String(process.env.MESSAGE_SWEEP_ENABLED || "false").toLowerCase() === "true";
 const MESSAGE_SWEEP_INTERVAL_MS = Math.max(300000, Number(process.env.MESSAGE_SWEEP_INTERVAL_MS || 600000));

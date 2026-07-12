@@ -3,8 +3,8 @@
   "storeId": "s82S7kUvElKFZr0Wo5XP",
   "botId": "fvhaRT8cqFytzfimeAMN",
   "database": "supabase-documents",
-  "filesVersion": "4.0.0",
-  "filesVersionNote": "Supabase-only Railway package; no Firebase service account or Firestore variables required",
+  "filesVersion": "4.1.0",
+  "filesVersionNote": "Node 22 + native WebSocket, fast polling (2s), higher AI concurrency (5)",
   "architecture": "whatsapp-bridge + supabase documents aiQueue/outbox + groq ai-worker + supabase remote session",
   "messages": "الرسائل الجديدة فقط بعد الربط — لا استيراد للمحادثات القديمة",
   "endpoints": [
