@@ -49,9 +49,14 @@ let botConfig = {
   closedMessage: "",
   fallbackMessage: "تم استلام رسالتك، وسنرد عليك قريباً.",
   isOpen: true,
+  paused: false,
   persona: "أنت مساعد ودود في متجر إلكتروني. رد باللغة العربية بشكل قصير ومفيد.",
   systemInstructions: "",
   tone: "ودود ومحترف",
+  role: "",
+  emojiLevel: "balanced",
+  charLimit: 500,
+  dialect: "auto",
   rules: [],
   knowledge: [],
   products: [],
@@ -91,9 +96,14 @@ function mergeConfig(d = {}, secrets = {}, store = {}) {
     closedMessage: textValue(d.closedMessage, d.offHoursMessage, store.closedMessage, store.offHoursMessage),
     fallbackMessage: textValue(d.fallbackMessage, store.fallbackMessage, "تم استلام رسالتك، وسنرد عليك قريباً."),
     isOpen: d.isOpen !== false && d.active !== false && store.isOpen !== false,
+    paused: !!(d.paused || store.paused),
     persona: textValue(d.persona, store.persona, defaultPersona),
     systemInstructions: textValue(d.systemInstructions, store.systemInstructions),
     tone: textValue(d.tone, store.tone, botConfig.tone),
+    role: textValue(d.role, store.role, ""),
+    emojiLevel: ["none", "low", "balanced", "high"].includes(d.emojiLevel) ? d.emojiLevel : (botConfig.emojiLevel || "balanced"),
+    charLimit: typeof d.charLimit === "number" ? Math.max(80, Math.min(2000, d.charLimit)) : (botConfig.charLimit || 500),
+    dialect: textValue(d.dialect, store.dialect, "auto"),
     rules: asArray(d.rules).length ? asArray(d.rules) : asArray(store.rules),
     knowledge: [...asArray(store.knowledge), ...asArray(d.knowledge)],
     products: [...asArray(store.products), ...asArray(d.products)],
@@ -105,7 +115,10 @@ function mergeConfig(d = {}, secrets = {}, store = {}) {
     botName,
     language: textValue(d.language, store.language, "ar"),
     temperature: typeof d.temperature === "number" ? Math.max(0, Math.min(1, d.temperature)) : botConfig.temperature,
-    maxTokens: typeof d.maxTokens === "number" ? Math.max(80, Math.min(1200, d.maxTokens)) : botConfig.maxTokens,
+    // maxTokens مشتق تقريبياً من charLimit (حرف عربي ≈ توكن واحد)
+    maxTokens: typeof d.maxTokens === "number"
+      ? Math.max(80, Math.min(1200, d.maxTokens))
+      : Math.max(80, Math.min(1200, Math.round((typeof d.charLimit === "number" ? d.charLimit : 500) * 1.2))),
     workingHours: d.workingHours || store.workingHours || null,
     offHoursMessage: textValue(d.offHoursMessage, d.closedMessage, store.offHoursMessage, store.closedMessage),
     humanHandoff: !!(d.humanHandoff || store.humanHandoff),
@@ -229,12 +242,50 @@ function isWithinWorkingHours() {
 // بناء system prompt من كل ما تعلّمه المستخدم
 // ============================================================
 function buildSystemPrompt() {
+  const ROLE_MAP = {
+    sales: "أنت مندوب مبيعات محترف. هدفك إقناع العميل بشراء المنتج المناسب له مع تقديم قيمة حقيقية.",
+    support: "أنت موظف دعم عملاء صبور. هدفك حل مشكلة العميل بأقصى سرعة ووضوح.",
+    scheduler: "أنت مسؤول جدولة مواعيد. اجمع من العميل الوقت والتاريخ المناسبين بدقة.",
+    analyst: "أنت محلل بيانات. قدم إجابات مبنية على الأرقام والوقائع الموجودة فقط.",
+    assistant: "أنت مساعد شخصي ذكي يساعد العميل في مهامه اليومية بسرعة وترتيب.",
+    advisor: "أنت مستشار موثوق. قدم نصائح مبنية على معرفة المتجر المحفوظة فقط.",
+    teacher: "أنت معلم يشرح بأسلوب مبسّط وواضح خطوة بخطوة.",
+    recruiter: "أنت موظف توظيف. تحاور مع المتقدمين بطريقة مهنية وودودة.",
+    reception: "أنت موظف استقبال. رحّب بالعميل ووجّهه للقسم المناسب بلطف.",
+    concierge: "أنت خدمة كونسيرج راقية. لبِّ طلبات العميل بأسلوب فاخر ومهذب.",
+    health: "أنت مساعد صحي. قدم إرشادات صحية عامة، وذكّر العميل بمراجعة طبيب مختص.",
+    finance: "أنت مستشار مالي. اشرح الخيارات والأسعار بوضوح ودون مبالغة.",
+  };
+  const EMOJI_MAP = {
+    none: "ممنوع استخدام أي إيموجي إطلاقاً.",
+    low: "استخدم إيموجي واحداً كحد أقصى في الرد، وفقط عند الحاجة.",
+    balanced: "استخدم بين 1 و3 إيموجي في الرد الواحد بشكل طبيعي.",
+    high: "استخدم من 3 إلى 5 إيموجي لجعل الرد مرحاً وحيوياً.",
+  };
+  const DIALECT_MAP = {
+    auto: "استخدم نفس لهجة العميل تلقائياً.",
+    khaleeji: "رد باللهجة الخليجية.",
+    egyptian: "رد باللهجة المصرية.",
+    levantine: "رد باللهجة الشامية.",
+    maghrebi: "رد باللهجة المغاربية.",
+    fusha: "رد باللغة العربية الفصحى فقط.",
+  };
+
   const parts = [
     botConfig.persona,
     `\n=== هوية المتجر والوكيل ===\nاسم المتجر: ${botConfig.storeName || "المتجر"}\nاسم الوكيل: ${botConfig.botName || "المساعد"}`,
   ];
+  if (botConfig.role && ROLE_MAP[botConfig.role]) {
+    parts.push(`\n=== دور الوكيل ===\n${ROLE_MAP[botConfig.role]}`);
+  }
   if (botConfig.systemInstructions) parts.push("\n=== تعليمات النظام ===\n" + botConfig.systemInstructions);
   if (botConfig.tone) parts.push(`\n=== النبرة ===\n${botConfig.tone}`);
+  if (botConfig.dialect && DIALECT_MAP[botConfig.dialect]) {
+    parts.push(`\n=== اللهجة ===\n${DIALECT_MAP[botConfig.dialect]}`);
+  }
+  if (EMOJI_MAP[botConfig.emojiLevel]) {
+    parts.push(`\n=== الإيموجي ===\n${EMOJI_MAP[botConfig.emojiLevel]}`);
+  }
   if (botConfig.rules.length) {
     parts.push("\n=== قوانين يجب الالتزام بها ===\n" + botConfig.rules.map((r, i) => `${i + 1}. ${r}`).join("\n"));
   }
@@ -247,7 +298,8 @@ function buildSystemPrompt() {
   if (botConfig.faqs.length) {
     parts.push("\n=== أسئلة شائعة ===\n" + botConfig.faqs.map((f) => `س: ${f.q}\nج: ${f.a}`).join("\n"));
   }
-  parts.push("\n=== تعليمات ===\nرد بلغة العميل، وباختصار (سطر أو سطرين). لا تخترع معلومات غير موجودة أعلاه.");
+  const charLimit = botConfig.charLimit || 500;
+  parts.push(`\n=== تعليمات إلزامية ===\n- لا تتجاوز ${charLimit} حرف في أي رد.\n- لا تخترع معلومات غير موجودة في السياق أعلاه.\n- كن مباشراً ومفيداً.`);
   return parts.join("\n");
 }
 
@@ -322,6 +374,11 @@ async function processJob(phone, body, msgId, chatId = null) {
   await configPromise;
 
   // 1) المتجر/البوت مغلق أو خارج ساعات العمل — أعلى أولوية دائماً ولا يتجاوزها أي ذكاء/تحويل.
+  // 0) الوكيل موقوف يدوياً من زر ON/OFF في لوحة التحكم — تجاهل الرسالة بصمت
+  if (botConfig.paused) {
+    await markIncomingAiDone(phone, msgId, { aiResponse: null, aiSource: "paused" });
+    return;
+  }
   if (!botConfig.isOpen) {
     const closed = botConfig.closedMessage || botConfig.offHoursMessage || DEFAULT_CLOSED_MESSAGE;
     await queueAiReply(phone, closed, { source: "closed", chatId });
