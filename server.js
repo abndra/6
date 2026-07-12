@@ -45,6 +45,9 @@ const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "";
 const NEW_MESSAGE_GRACE_SEC = Number(process.env.NEW_MESSAGE_GRACE_SEC || 45);
 const REMOTE_SESSION_BACKUP_MS = Math.max(60000, Number(process.env.REMOTE_SESSION_BACKUP_MS || 60000));
 const REMOTE_SESSION_CLIENT_ID = String(process.env.REMOTE_SESSION_CLIENT_ID || `${STORE_ID}_${BOT_ID}`).replace(/[^a-z0-9_-]/gi, "_");
+const OUTBOX_POLL_INTERVAL_MS = Math.max(3000, Number(process.env.OUTBOX_POLL_INTERVAL_MS || 5000));
+const MESSAGE_SWEEP_INTERVAL_MS = Math.max(15000, Number(process.env.MESSAGE_SWEEP_INTERVAL_MS || 30000));
+const MESSAGE_SWEEP_LIMIT = Math.max(5, Math.min(30, Number(process.env.MESSAGE_SWEEP_LIMIT || 12)));
 
 // ---- عميل واتساب ----
 const client = new Client({
@@ -209,22 +212,56 @@ setInterval(() => {
   verifyConnectionState({ persist: true }).catch(() => {});
 }, 15000).unref?.();
 
-// ---- استقبال الرسائل: الرسائل الجديدة فقط (لا استيراد للقديمة) ----
-client.on("message", async (msg) => {
+async function handleIncomingMessage(msg, source = "event") {
   try {
     if (!isRealCustomer(msg.from || "")) return; // تجاهل المجموعات/البث فقط، واقبل @c.us و @lid للعملاء
+    if (msg.fromMe) return;
     if (msg.isStatus) return;
     // تجاهل أي رسالة وصلت قبل اكتمال الربط (رسائل قديمة/مزامنة أولية)
     if (readyAtSec && Number(msg.timestamp) && Number(msg.timestamp) < readyAtSec) return;
-    await upsertCustomer(msg);
     const saved = await saveIncomingMessage(msg); // → يضعها في aiQueue ليقرأها عامل الذكاء
-    if (saved) await logEvent("incoming_saved", { phone: saved.phone, msgId: saved.msgId, type: msg.type || "text" });
+    if (saved) {
+      await upsertCustomer(msg);
+      await logEvent("incoming_saved", { phone: saved.phone, msgId: saved.msgId, type: msg.type || "text", source });
+    }
   } catch (e) {
     console.error("message handler error:", e);
     await logEvent("error", { where: "incoming", message: e.message });
   }
+}
 
+// ---- استقبال الرسائل: الرسائل الجديدة فقط (لا استيراد للقديمة) ----
+client.on("message", async (msg) => {
+  await handleIncomingMessage(msg, "event");
 });
+
+async function sweepRecentMessages() {
+  if (connectionState !== "connected") return;
+  const live = await verifyConnectionState({ persist: false });
+  if (live.connected === false) return;
+  try {
+    const chats = await client.getChats();
+    let seen = 0;
+    for (const chat of chats.slice(0, 50)) {
+      const chatId = chat?.id?._serialized || "";
+      if (!isRealCustomer(chatId)) continue;
+      const messages = await chat.fetchMessages({ limit: MESSAGE_SWEEP_LIMIT });
+      for (const msg of messages) {
+        if (msg.fromMe || msg.isStatus) continue;
+        await handleIncomingMessage(msg, "sweep");
+        seen += 1;
+      }
+    }
+    await setConnectionState({ messageSweepAt: admin.firestore.FieldValue.serverTimestamp(), messageSweepSeen: seen });
+  } catch (e) {
+    console.error("message sweep error:", e.message);
+    await logEvent("message_sweep_error", { message: e.message }).catch(() => {});
+  }
+}
+
+setInterval(() => {
+  sweepRecentMessages().catch((e) => console.error("message sweep failed:", e.message));
+}, MESSAGE_SWEEP_INTERVAL_MS).unref?.();
 
 // ---- الرسائل الصادرة يدوياً من الهاتف نفسه: حفظ للعرض (الجديدة فقط) ----
 client.on("message_create", async (msg) => {
@@ -251,22 +288,54 @@ client.initialize().catch(async (error) => {
 // مراقبة طابور الإرسال (outbox) — إرسال أي رد جديد فوراً
 // ============================================================
 const sending = new Set(); // منع الإرسال المزدوج لنفس الوثيقة
+let unsubscribeOutbox = null;
+let outboxListenerRetryTimer = null;
 
-botRef()
-  .collection("outbox")
-  .where("status", "==", "pending")
-  .onSnapshot(
-    async (snap) => {
-      snap.docChanges().forEach((change) => {
-        if (change.type !== "added") return;
-        const doc = change.doc;
-        if (sending.has(doc.id)) return;
-        sending.add(doc.id);
-        sendOne(doc).finally(() => sending.delete(doc.id));
-      });
-    },
-    (err) => console.error("outbox listener error:", err.message),
-  );
+function startOutboxDoc(doc) {
+  if (!doc?.id || sending.has(doc.id)) return false;
+  sending.add(doc.id);
+  sendOne(doc).finally(() => sending.delete(doc.id));
+  return true;
+}
+
+function attachOutboxListener() {
+  try {
+    if (typeof unsubscribeOutbox === "function") unsubscribeOutbox();
+  } catch {}
+  unsubscribeOutbox = botRef()
+    .collection("outbox")
+    .where("status", "==", "pending")
+    .onSnapshot(
+      async (snap) => {
+        snap.docChanges().forEach((change) => {
+          if (change.type !== "added" && change.type !== "modified") return;
+          startOutboxDoc(change.doc);
+        });
+      },
+      (err) => {
+        console.error("outbox listener error:", err.message);
+        logEvent("outbox_listener_error", { message: err.message }).catch(() => {});
+        clearTimeout(outboxListenerRetryTimer);
+        outboxListenerRetryTimer = setTimeout(attachOutboxListener, 5000);
+        outboxListenerRetryTimer.unref?.();
+      },
+    );
+}
+
+async function drainPendingOutbox(reason = "poll") {
+  if (connectionState !== "connected") return;
+  const live = await verifyConnectionState({ persist: true });
+  if (live.connected === false) return;
+  const pend = await botRef().collection("outbox").where("status", "==", "pending").limit(25).get();
+  pend.forEach((d) => startOutboxDoc(d));
+  await setConnectionState({ outboxHeartbeatAt: admin.firestore.FieldValue.serverTimestamp(), outboxPendingSeen: pend.size, outboxLastDrainReason: reason });
+}
+
+attachOutboxListener();
+
+setInterval(() => {
+  drainPendingOutbox("interval").catch((e) => console.error("outbox drain error:", e.message));
+}, OUTBOX_POLL_INTERVAL_MS).unref?.();
 
 async function sendOne(doc) {
   const { phone, chatId, text, convMsgId } = doc.data() || {};
@@ -297,12 +366,7 @@ async function sendOne(doc) {
 // عند عودة الاتصال، أعد فحص أي رسائل بقيت pending
 client.on("ready", async () => {
   try {
-    const pend = await botRef().collection("outbox").where("status", "==", "pending").get();
-    pend.forEach((d) => {
-      if (sending.has(d.id)) return;
-      sending.add(d.id);
-      sendOne(d).finally(() => sending.delete(d.id));
-    });
+    await drainPendingOutbox("ready");
   } catch (e) {
     console.error("resend pending error:", e.message);
   }

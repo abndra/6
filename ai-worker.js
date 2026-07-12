@@ -21,6 +21,7 @@ const {
   storeRef,
   botRef,
   botSecretsRef,
+  FieldValue,
   queueAiReply,
   readBotSecrets,
   readStoreConfig,
@@ -31,6 +32,10 @@ const {
 
 const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 const STALE_PROCESSING_MS = Number(process.env.AI_STALE_PROCESSING_MS || 120000);
+const AI_POLL_INTERVAL_MS = Math.max(3000, Number(process.env.AI_POLL_INTERVAL_MS || 5000));
+const AI_RECOVER_INTERVAL_MS = Math.max(15000, Number(process.env.AI_RECOVER_INTERVAL_MS || 30000));
+const AI_GROQ_TIMEOUT_MS = Math.max(10000, Number(process.env.AI_GROQ_TIMEOUT_MS || 30000));
+const AI_MAX_CONCURRENT = Math.max(1, Math.min(5, Number(process.env.AI_MAX_CONCURRENT || 2)));
 
 // ---- إعدادات البوت الحيّة (تُحدّث لحظياً من Firestore) ----
 let botConfig = {
@@ -234,23 +239,33 @@ async function askGroq(userMessage, history = []) {
   const key = String(botConfig.groqApiKey || "").trim();
   if (!key) throw new Error("GROQ_API_KEY missing (أضف مفتاح Groq في إعدادات البوت)");
 
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-    body: JSON.stringify({
-      model: GROQ_MODEL,
-      messages: [
-        { role: "system", content: buildSystemPrompt() },
-        ...history.slice(-6),
-        { role: "user", content: userMessage },
-      ],
-      temperature: botConfig.temperature,
-      max_tokens: botConfig.maxTokens,
-    }),
-  });
-  if (!res.ok) throw new Error(`Groq ${res.status}: ${await res.text()}`);
-  const j = await res.json();
-  return j.choices?.[0]?.message?.content?.trim() || "";
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), AI_GROQ_TIMEOUT_MS);
+  try {
+    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      signal: controller.signal,
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        messages: [
+          { role: "system", content: buildSystemPrompt() },
+          ...history.slice(-6),
+          { role: "user", content: userMessage },
+        ],
+        temperature: botConfig.temperature,
+        max_tokens: botConfig.maxTokens,
+      }),
+    });
+    if (!res.ok) throw new Error(`Groq ${res.status}: ${await res.text()}`);
+    const j = await res.json();
+    return j.choices?.[0]?.message?.content?.trim() || "";
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error(`Groq timeout after ${Math.round(AI_GROQ_TIMEOUT_MS / 1000)}s`);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function loadHistory(phone) {
@@ -333,25 +348,93 @@ async function processJob(phone, body, msgId, chatId = null) {
 }
 
 // ============================================================
-// الاستماع لطابور الذكاء — سرعة فورية عبر onSnapshot
+// الاستماع لطابور الذكاء — onSnapshot للسرعة + polling دائم كشبكة أمان
 // ============================================================
 const processing = new Set();
+let unsubscribeAiQueue = null;
+let aiListenerRetryTimer = null;
+let drainingQueue = false;
 
-botRef()
-  .collection("aiQueue")
-  .where("status", "==", "pending")
-  .onSnapshot(
-    (snap) => {
-      snap.docChanges().forEach((change) => {
-        if (change.type !== "added") return;
-        const doc = change.doc;
-        if (processing.has(doc.id)) return;
-        processing.add(doc.id);
-        handleQueueDoc(doc).finally(() => processing.delete(doc.id));
+function canStartMoreJobs() {
+  return processing.size < AI_MAX_CONCURRENT;
+}
+
+function startQueueDoc(doc) {
+  if (!doc?.id || processing.has(doc.id) || !canStartMoreJobs()) return false;
+  processing.add(doc.id);
+  handleQueueDoc(doc).finally(() => processing.delete(doc.id));
+  return true;
+}
+
+function attachAiQueueListener() {
+  try {
+    if (typeof unsubscribeAiQueue === "function") unsubscribeAiQueue();
+  } catch {}
+  unsubscribeAiQueue = botRef()
+    .collection("aiQueue")
+    .where("status", "==", "pending")
+    .onSnapshot(
+      (snap) => {
+        snap.docChanges().forEach((change) => {
+          if (change.type !== "added" && change.type !== "modified") return;
+          startQueueDoc(change.doc);
+        });
+      },
+      (err) => {
+        console.error("aiQueue listener error:", err.message);
+        logEvent("ai_listener_error", { message: err.message }).catch(() => {});
+        clearTimeout(aiListenerRetryTimer);
+        aiListenerRetryTimer = setTimeout(attachAiQueueListener, 5000);
+        aiListenerRetryTimer.unref?.();
+      },
+    );
+}
+
+async function recoverStuckJobs() {
+  const stuck = await botRef().collection("aiQueue").where("status", "==", "processing").limit(100).get();
+  const cutoff = Date.now() - STALE_PROCESSING_MS;
+  const writes = [];
+  stuck.forEach((d) => {
+    if (processing.has(d.id)) return;
+    const claimed = d.data().claimedAt;
+    const claimedMs = typeof claimed?.toMillis === "function" ? claimed.toMillis() : claimed instanceof Date ? claimed.getTime() : 0;
+    if (claimedMs && claimedMs > cutoff) return;
+    writes.push(d.ref.set({ status: "pending", recoveredAt: FieldValue.serverTimestamp() }, { merge: true }));
+  });
+  await Promise.all(writes);
+}
+
+async function drainPendingJobs(reason = "poll") {
+  if (drainingQueue) return;
+  drainingQueue = true;
+  try {
+    await recoverStuckJobs();
+    while (canStartMoreJobs()) {
+      const limit = Math.max(1, AI_MAX_CONCURRENT - processing.size);
+      const pend = await botRef().collection("aiQueue").where("status", "==", "pending").limit(limit).get();
+      if (pend.empty) break;
+      let started = 0;
+      pend.forEach((d) => {
+        if (startQueueDoc(d)) started += 1;
       });
-    },
-    (err) => console.error("aiQueue listener error:", err.message),
-  );
+      if (!started) break;
+    }
+    await botRef().set(
+      {
+        aiWorkerStatus: "running",
+        aiWorkerHeartbeatAt: FieldValue.serverTimestamp(),
+        aiWorkerProcessing: processing.size,
+        aiWorkerLastDrainReason: reason,
+      },
+      { merge: true },
+    );
+  } catch (e) {
+    console.error("ai queue drain error:", e.message);
+    await logEvent("ai_queue_drain_error", { message: e.message }).catch(() => {});
+  } finally {
+    drainingQueue = false;
+  }
+}
 
 async function handleQueueDoc(doc) {
   const ref = doc.ref;
@@ -362,7 +445,7 @@ async function handleQueueDoc(doc) {
       const fresh = await tx.get(ref);
       if (!fresh.exists) return;
       if (fresh.data().status !== "pending") return;
-      tx.update(ref, { status: "processing", claimedAt: new Date() });
+      tx.update(ref, { status: "processing", claimedAt: FieldValue.serverTimestamp() });
       claimed = true;
     });
   } catch (e) {
@@ -382,24 +465,20 @@ async function handleQueueDoc(doc) {
 }
 
 console.log("🤖 عامل الذكاء (Groq) يعمل ويستمع لطابور الرسائل...");
+attachAiQueueListener();
+
+setInterval(() => {
+  drainPendingJobs("interval").catch(() => {});
+}, AI_POLL_INTERVAL_MS).unref?.();
+
+setInterval(() => {
+  recoverStuckJobs().catch((e) => console.error("recover stuck jobs error:", e.message));
+}, AI_RECOVER_INTERVAL_MS).unref?.();
 
 // عند الإقلاع، عالِج أي رسائل بقيت pending
 (async () => {
   try {
-    const pend = await botRef().collection("aiQueue").where("status", "==", "pending").get();
-    pend.forEach((d) => {
-      if (processing.has(d.id)) return;
-      processing.add(d.id);
-      handleQueueDoc(d).finally(() => processing.delete(d.id));
-    });
-    const stuck = await botRef().collection("aiQueue").where("status", "==", "processing").get();
-    const cutoff = Date.now() - STALE_PROCESSING_MS;
-    stuck.forEach((d) => {
-      const claimed = d.data().claimedAt;
-      const claimedMs = typeof claimed?.toMillis === "function" ? claimed.toMillis() : claimed instanceof Date ? claimed.getTime() : 0;
-      if (claimedMs && claimedMs > cutoff) return;
-      d.ref.set({ status: "pending", recoveredAt: new Date() }, { merge: true }).catch((e) => console.error("recover stuck job:", e.message));
-    });
+    await drainPendingJobs("startup");
   } catch (e) {
     console.error("startup drain error:", e.message);
   }

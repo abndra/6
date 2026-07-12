@@ -38,7 +38,9 @@ Restart أو Deploy في Railway ولا يظهر الهاتف كأنه سجّل 
 4. يكتب الرد في المحادثة ويضيفه إلى `.../outbox` بحالة `pending`.
 5. `server.js` يسمع `outbox` لحظياً، يلتقط الرد ويرسله للرقم، ثم يعلّمه `sent`.
 
-كل خطوة تعتمد `onSnapshot` (دفع فوري) — لا انتظار ولا استعلام دوري = سرعة قصوى.
+كل خطوة تعتمد `onSnapshot` (دفع فوري) للسرعة، ومعها مراقب دائم كل 5 ثوانٍ
+يعيد فحص `aiQueue` و`outbox`. لو انقطع الاستماع اللحظي مؤقتاً أو بقيت مهمة
+عالقة بحالة `processing`، يعيدها النظام تلقائياً ولا تتوقف الردود بعد دقائق.
 
 ---
 
@@ -69,6 +71,8 @@ Firebase Console → ⚙️ Project Settings → **Service accounts** →
 | `TAYSIR_BOT_ID` | id البوت (`stores/xxx/bots/yyy`) |
 | `SERVICE_TOKEN` | (اختياري) نفس قيمة `railwayApiKey` في إعدادات البوت |
 | `GROQ_API_KEY` | (اختياري) احتياطي فقط — الأساس أن يُقرأ لكل بوت من إعداداته |
+| `AI_POLL_INTERVAL_MS` | (اختياري) افتراضي 5000 — مراقبة طابور الذكاء دائماً |
+| `OUTBOX_POLL_INTERVAL_MS` | (اختياري) افتراضي 5000 — مراقبة طابور الإرسال دائماً |
 
 > مفتاح Groq لكل بوت يُقرأ تلقائياً من Firestore
 > (`botSecrets/{botId}.groqApiKey` أو `bots/{botId}.groqApiKey`)، لذا كل بوت

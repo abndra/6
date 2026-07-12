@@ -12,6 +12,7 @@
 
 const admin = require("firebase-admin");
 const { getFirestore } = require("firebase-admin/firestore");
+const crypto = require("crypto");
 
 // ---- تهيئة Firebase Admin مرة واحدة فقط ----
 if (!admin.apps.length) {
@@ -84,6 +85,15 @@ function isRealCustomer(jid) {
   if (/@lid$/.test(value)) return /^[a-zA-Z0-9_.-]{4,80}$/.test(phoneFromJid(value));
   return false;
 }
+function stableMessageDocId(msg, jid, body) {
+  const raw = String(msg?.id?._serialized || "").trim();
+  if (raw) return `wa_${safeDocId(raw)}`;
+  const hash = crypto
+    .createHash("sha1")
+    .update([jid, msg?.timestamp || "", body || "", msg?.type || "text"].join("|"))
+    .digest("hex");
+  return `wa_${hash}`;
+}
 
 // ============================================================
 // 1) حفظ / تحديث العميل
@@ -124,9 +134,14 @@ async function saveIncomingMessage(msg) {
   const chatId = String(jid || "");
   const name = msg._data?.notifyName || msg.pushName || phone;
   const body = msg.body || "";
+  const messageDocId = stableMessageDocId(msg, jid, body);
 
   // 2.a) رأس المحادثة
   const convRef = botRef().collection("conversations").doc(phone);
+  const msgDoc = convRef.collection("messages").doc(messageDocId);
+  const alreadySaved = await msgDoc.get();
+  if (alreadySaved.exists) return null;
+
   await convRef.set(
     {
       phone,
@@ -142,7 +157,7 @@ async function saveIncomingMessage(msg) {
   );
 
   // 2.b) الرسالة داخل المحادثة (للعرض في لوحة المتجر)
-  const msgDoc = await convRef.collection("messages").add({
+  await msgDoc.set({
     from: jid,
     chatId,
     fromMe: false,
@@ -155,7 +170,7 @@ async function saveIncomingMessage(msg) {
   });
 
   // 2.c) نسخة مسطّحة للعدّاد السريع
-  await botRef().collection("messages").add({
+  await botRef().collection("messages").doc(messageDocId).set({
     conversationId: phone,
     chatId,
     fromMe: false,
@@ -166,7 +181,7 @@ async function saveIncomingMessage(msg) {
   await botRef().set({ messagesCount: FieldValue.increment(1), lastMessageAt: now() }, { merge: true });
 
   // 2.d) طابور الذكاء — العامل المنفصل يستمع لهذه المجموعة
-  await botRef().collection("aiQueue").add({
+  await botRef().collection("aiQueue").doc(messageDocId).set({
     phone,
     chatId,
     name,
