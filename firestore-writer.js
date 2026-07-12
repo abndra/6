@@ -61,10 +61,28 @@ const now = () => FieldValue.serverTimestamp();
 function phoneFromJid(jid) {
   return String(jid || "").replace(/@.*/, "");
 }
+function jidDomain(jid) {
+  return String(jid || "").split("@")[1] || "";
+}
+function safeDocId(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .slice(0, 120);
+}
+function customerIdFromJid(jid) {
+  const raw = phoneFromJid(jid);
+  if (/@c\.us$/.test(String(jid || "")) && /^\d{8,15}$/.test(raw)) return raw;
+  if (/@lid$/.test(String(jid || "")) && raw) return `lid_${safeDocId(raw)}`;
+  return safeDocId(raw);
+}
 function isRealCustomer(jid) {
-  if (!/@c\.us$/.test(String(jid || ""))) return false;
-  const phone = phoneFromJid(jid);
-  return /^\d{8,15}$/.test(phone);
+  const value = String(jid || "");
+  if (/@c\.us$/.test(value)) return /^\d{8,15}$/.test(phoneFromJid(value));
+  // واتساب بدأ يُرجع بعض العملاء بصيغة @lid بدلاً من رقم الهاتف.
+  // تجاهله يعني أن الرسائل تصل للسيرفر لكن لا تُحفظ ولا يرد الذكاء.
+  if (/@lid$/.test(value)) return /^[a-zA-Z0-9_.-]{4,80}$/.test(phoneFromJid(value));
+  return false;
 }
 
 // ============================================================
@@ -73,13 +91,17 @@ function isRealCustomer(jid) {
 async function upsertCustomer(msg) {
   const jid = msg.from || msg.to;
   if (!isRealCustomer(jid)) return;
-  const phone = phoneFromJid(jid);
+  const phone = customerIdFromJid(jid);
+  const rawPhone = phoneFromJid(jid);
   await botRef()
     .collection("customers")
     .doc(phone)
     .set(
       {
         phone,
+        rawPhone,
+        chatId: jid,
+        jidDomain: jidDomain(jid),
         name: msg._data?.notifyName || msg.pushName || phone,
         lastSeenAt: now(),
         lastMessage: msg.body || "",
@@ -97,7 +119,9 @@ async function upsertCustomer(msg) {
 async function saveIncomingMessage(msg) {
   const jid = msg.from;
   if (!isRealCustomer(jid)) return null;
-  const phone = phoneFromJid(jid);
+  const phone = customerIdFromJid(jid);
+  const rawPhone = phoneFromJid(jid);
+  const chatId = String(jid || "");
   const name = msg._data?.notifyName || msg.pushName || phone;
   const body = msg.body || "";
 
@@ -106,6 +130,9 @@ async function saveIncomingMessage(msg) {
   await convRef.set(
     {
       phone,
+      rawPhone,
+      chatId,
+      jidDomain: jidDomain(jid),
       name,
       lastMessage: body || `[${msg.type}]`,
       updatedAt: now(),
@@ -117,6 +144,7 @@ async function saveIncomingMessage(msg) {
   // 2.b) الرسالة داخل المحادثة (للعرض في لوحة المتجر)
   const msgDoc = await convRef.collection("messages").add({
     from: jid,
+    chatId,
     fromMe: false,
     body,
     type: msg.type || "text",
@@ -129,6 +157,7 @@ async function saveIncomingMessage(msg) {
   // 2.c) نسخة مسطّحة للعدّاد السريع
   await botRef().collection("messages").add({
     conversationId: phone,
+    chatId,
     fromMe: false,
     body,
     timestamp: now(),
@@ -139,6 +168,7 @@ async function saveIncomingMessage(msg) {
   // 2.d) طابور الذكاء — العامل المنفصل يستمع لهذه المجموعة
   await botRef().collection("aiQueue").add({
     phone,
+    chatId,
     name,
     body,
     msgId: msgDoc.id,
@@ -177,11 +207,13 @@ async function markIncomingAiError(phone, msgId, message) {
 async function saveManualOutgoing(msg) {
   const jid = msg.to;
   if (!isRealCustomer(jid)) return;
-  const phone = phoneFromJid(jid);
+  const phone = customerIdFromJid(jid);
+  const chatId = String(jid || "");
   const convRef = botRef().collection("conversations").doc(phone);
-  await convRef.set({ phone, lastMessage: msg.body || "", updatedAt: now(), unreadCount: 0 }, { merge: true });
+  await convRef.set({ phone, chatId, lastMessage: msg.body || "", updatedAt: now(), unreadCount: 0 }, { merge: true });
   await convRef.collection("messages").add({
     from: "me",
+    chatId,
     fromMe: true,
     body: msg.body || "",
     type: msg.type || "text",
@@ -193,11 +225,11 @@ async function saveManualOutgoing(msg) {
 // ============================================================
 // 4) عامل الذكاء: كتابة الرد في المحادثة + وضعه في طابور الإرسال
 // ============================================================
-async function queueAiReply(phone, text, { source = "ai" } = {}) {
-  return queueOutgoingMessage(phone, text, { source });
+async function queueAiReply(phone, text, { source = "ai", chatId = null } = {}) {
+  return queueOutgoingMessage(phone, text, { source, chatId });
 }
 
-async function queueOutgoingMessage(phone, text, { source = "api" } = {}) {
+async function queueOutgoingMessage(phone, text, { source = "api", chatId = null } = {}) {
   const convRef = botRef().collection("conversations").doc(phone);
 
   // 4.a) الرسالة الصادرة داخل المحادثة (تظهر فوراً في اللوحة)
@@ -205,17 +237,19 @@ async function queueOutgoingMessage(phone, text, { source = "api" } = {}) {
     from: "bot",
     fromMe: true,
     body: text,
+    chatId,
     type: "text",
     timestamp: now(),
     aiHandled: true,
     source,
     deliveryStatus: "queued",
   });
-  await convRef.set({ lastMessage: text, updatedAt: now() }, { merge: true });
+  await convRef.set({ lastMessage: text, updatedAt: now(), ...(chatId ? { chatId } : {}) }, { merge: true });
 
   // 4.b) طابور الإرسال — خادم واتساب يستمع لهذه المجموعة ويرسل فوراً
   await botRef().collection("outbox").add({
     phone,
+    chatId,
     text,
     convMsgId: msgDoc.id,
     status: "pending",
@@ -296,6 +330,7 @@ module.exports = {
   botRef,
   botSecretsRef,
   phoneFromJid,
+  customerIdFromJid,
   isRealCustomer,
   upsertCustomer,
   saveIncomingMessage,

@@ -3,9 +3,9 @@
   "storeId": "RTdIAtwTwu2FKViEzbBe",
   "botId": "sF8d1BUjlJGEqZlUSN22",
   "firestoreDatabaseId": "default",
-  "filesVersion": "3.1.0",
-  "filesVersionNote": "Store-level training fallback + safer new-message gate + Firestore aiQueue/outbox recovery",
-  "architecture": "whatsapp-bridge + firestore aiQueue/outbox + groq ai-worker",
+  "filesVersion": "3.2.0",
+  "filesVersionNote": "Persistent WhatsApp RemoteAuth in Firestore + @lid customer support + live connection verification",
+  "architecture": "whatsapp-bridge + firestore aiQueue/outbox + groq ai-worker + firestore remote session",
   "messages": "الرسائل الجديدة فقط بعد الربط — لا استيراد للمحادثات القديمة",
   "endpoints": [
     "GET /health",
@@ -29,6 +29,7 @@
     "GROQ_MODEL",
     "GROQ_API_KEY",
     "FIRESTORE_DATABASE_ID",
-    "NEW_MESSAGE_GRACE_SEC"
+    "NEW_MESSAGE_GRACE_SEC",
+    "REMOTE_SESSION_BACKUP_MS"
   ]
 }

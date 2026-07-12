@@ -282,7 +282,7 @@ async function isFirstMessage(phone) {
 // ============================================================
 // معالجة رسالة واحدة من الطابور
 // ============================================================
-async function processJob(phone, body, msgId) {
+async function processJob(phone, body, msgId, chatId = null) {
   const text = (body || "").trim();
   if (!text) return;
 
@@ -294,25 +294,25 @@ async function processJob(phone, body, msgId) {
 
   // 1) المتجر/البوت مغلق أو خارج ساعات العمل
   if (!botConfig.isOpen && botConfig.closedMessage) {
-    await queueAiReply(phone, botConfig.closedMessage, { source: "closed" });
+    await queueAiReply(phone, botConfig.closedMessage, { source: "closed", chatId });
     await markIncomingAiDone(phone, msgId, { aiResponse: botConfig.closedMessage, aiSource: "closed" });
     return;
   }
   if (!isWithinWorkingHours() && botConfig.offHoursMessage) {
-    await queueAiReply(phone, botConfig.offHoursMessage, { source: "closed" });
+    await queueAiReply(phone, botConfig.offHoursMessage, { source: "closed", chatId });
     await markIncomingAiDone(phone, msgId, { aiResponse: botConfig.offHoursMessage, aiSource: "closed" });
     return;
   }
 
   // 2) ترحيب أول مرة (يُرسل كرسالة مستقلة سريعة)
   if (botConfig.greeting && (await isFirstMessage(phone))) {
-    await queueAiReply(phone, botConfig.greeting, { source: "greeting" });
+    await queueAiReply(phone, botConfig.greeting, { source: "greeting", chatId });
   }
 
   // 3) مطابقة فورية من الإعدادات (بدون Groq — أسرع رد ممكن)
   const instant = instantMatch(text);
   if (instant) {
-    await queueAiReply(phone, instant, { source: "instant" });
+    await queueAiReply(phone, instant, { source: "instant", chatId });
     await markIncomingAiDone(phone, msgId, { aiResponse: instant, aiSource: "instant" });
     return;
   }
@@ -322,12 +322,12 @@ async function processJob(phone, body, msgId) {
     const history = await loadHistory(phone);
     const reply = await askGroq(text, history);
     const finalReply = reply || botConfig.fallbackMessage;
-    await queueAiReply(phone, finalReply, { source: "groq" });
+    await queueAiReply(phone, finalReply, { source: "groq", chatId });
     await markIncomingAiDone(phone, msgId, { aiResponse: finalReply, aiSource: "groq", aiModel: GROQ_MODEL });
   } catch (e) {
     console.error("Groq failed:", e.message);
     await logEvent("groq_error", { phone, message: e.message });
-    await queueAiReply(phone, botConfig.fallbackMessage, { source: "fallback" });
+    await queueAiReply(phone, botConfig.fallbackMessage, { source: "fallback", chatId });
     await markIncomingAiError(phone, msgId, e.message);
   }
 }
@@ -371,9 +371,9 @@ async function handleQueueDoc(doc) {
   }
   if (!claimed) return;
 
-  const { phone, body, msgId } = doc.data() || {};
+  const { phone, body, msgId, chatId } = doc.data() || {};
   try {
-    await processJob(phone, body, msgId);
+    await processJob(phone, body, msgId, chatId || null);
     await ref.set({ status: "done", doneAt: new Date() }, { merge: true });
   } catch (e) {
     console.error("processJob error:", e.message);

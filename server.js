@@ -15,7 +15,7 @@
 // dependencies: whatsapp-web.js qrcode-terminal qrcode firebase-admin express
 // ============================================================
 
-const { Client, LocalAuth } = require("whatsapp-web.js");
+const { Client, RemoteAuth } = require("whatsapp-web.js");
 const qrcodeTerminal = require("qrcode-terminal");
 const QRCode = require("qrcode");
 const express = require("express");
@@ -34,34 +34,90 @@ const {
   markOutboxError,
   logEvent,
   setConnectionState,
+  isRealCustomer,
+  customerIdFromJid,
 } = require("./firestore-writer");
+const { createFirestoreRemoteStore } = require("./firestore-session-store");
 
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "";
 // نقبل الرسائل القريبة من لحظة الربط حتى لا تُرفض بسبب فرق توقيت واتساب،
 // وفي نفس الوقت لا نستورد المحادثات القديمة جداً.
 const NEW_MESSAGE_GRACE_SEC = Number(process.env.NEW_MESSAGE_GRACE_SEC || 45);
+const REMOTE_SESSION_BACKUP_MS = Math.max(60000, Number(process.env.REMOTE_SESSION_BACKUP_MS || 60000));
+const REMOTE_SESSION_CLIENT_ID = String(process.env.REMOTE_SESSION_CLIENT_ID || `${STORE_ID}_${BOT_ID}`).replace(/[^a-z0-9_-]/gi, "_");
 
 // ---- عميل واتساب ----
 const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: "./.wwebjs_auth" }),
+  authStrategy: new RemoteAuth({
+    clientId: REMOTE_SESSION_CLIENT_ID,
+    dataPath: "./.wwebjs_auth",
+    store: createFirestoreRemoteStore(),
+    backupSyncIntervalMs: REMOTE_SESSION_BACKUP_MS,
+  }),
   puppeteer: {
     headless: true,
     // على Railway يُثبَّت Chromium عبر Dockerfile ويُمرَّر مساره هنا.
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-extensions",
+      "--no-first-run",
+      "--disable-background-timer-throttling",
+    ],
   },
 });
 
 let latestQrRaw = null;
 let latestQrDataUrl = null;
 let connectionState = "disconnected";
+let lastWaState = null;
 let lastError = null;
+let remoteSessionSaved = false;
+let savingRemoteSession = false;
 const recentAutoSends = new Set();
 // وقت اكتمال الربط — نتجاهل أي رسالة أقدم منه حتى لا نستورد المحادثات القديمة.
 let readyAtSec = 0;
 
 function errorMessage(error) {
   return String(error?.message || error || "unknown error").slice(0, 500);
+}
+
+function isHealthyWaState(state) {
+  const value = String(state || "").toUpperCase();
+  return ["CONNECTED", "OPEN", "PAIRING", "TIMEOUT"].includes(value);
+}
+
+async function verifyConnectionState({ persist = false } = {}) {
+  if (connectionState !== "connected") return { connected: false, state: lastWaState || connectionState };
+  try {
+    const state = await client.getState();
+    lastWaState = state || null;
+    if (state && !isHealthyWaState(state)) {
+      connectionState = "disconnected";
+      lastError = `WhatsApp state: ${state}`;
+      if (persist) await setConnectionState({ connectionState: "disconnected", status: "pending", waConnected: false, lastError, waState: state });
+      return { connected: false, state };
+    }
+    return { connected: true, state };
+  } catch (error) {
+    lastError = errorMessage(error);
+    if (persist) await setConnectionState({ lastError, waState: lastWaState });
+    return { connected: connectionState === "connected", state: lastWaState, error: lastError };
+  }
+}
+
+async function saveRemoteSessionNow() {
+  if (savingRemoteSession) return;
+  if (typeof client.authStrategy?.storeRemoteSession !== "function") return;
+  savingRemoteSession = true;
+  try {
+    await client.authStrategy.storeRemoteSession({ emit: true });
+  } finally {
+    savingRemoteSession = false;
+  }
 }
 
 process.on("unhandledRejection", (error) => {
@@ -95,6 +151,7 @@ client.on("ready", async () => {
   latestQrRaw = null;
   latestQrDataUrl = null;
   readyAtSec = Math.floor(Date.now() / 1000) - NEW_MESSAGE_GRACE_SEC;
+  lastWaState = "CONNECTED";
   console.log("✓ WhatsApp متصل — سيتم حفظ الرسائل الجديدة فقط بعد هذه اللحظة");
   await logEvent("connected");
 
@@ -105,7 +162,28 @@ client.on("ready", async () => {
     lastQr: null,
     phoneNumber: client.info?.wid?.user || null,
     connectedAt: admin.firestore.FieldValue.serverTimestamp(),
+    remoteSessionSaved,
+    waState: lastWaState,
   });
+
+  // RemoteAuth يحفظ تلقائياً بعد دقيقة، لكن نحاول نسخة مبكرة أيضاً حتى لا تضيع
+  // الجلسة لو أعاد Railway التشغيل مباشرة بعد الربط.
+  [15000, 35000, 65000].forEach((delayMs) => {
+    setTimeout(async () => {
+      try {
+        if (!remoteSessionSaved || delayMs >= 65000) await saveRemoteSessionNow();
+      } catch (error) {
+        console.error("early remote session save failed:", errorMessage(error));
+      }
+    }, delayMs).unref?.();
+  });
+});
+
+client.on("remote_session_saved", async () => {
+  remoteSessionSaved = true;
+  console.log("✓ تم حفظ جلسة واتساب في Firestore — لن تضيع بعد Restart/Deploy");
+  await logEvent("remote_session_saved", {});
+  await setConnectionState({ remoteSessionSaved: true });
 });
 
 client.on("auth_failure", async (m) => {
@@ -118,14 +196,23 @@ client.on("auth_failure", async (m) => {
 client.on("disconnected", async (reason) => {
   lastError = errorMessage(reason || "disconnected");
   connectionState = "disconnected";
+  lastWaState = String(reason || "disconnected");
   await logEvent("disconnected", { reason });
   await setConnectionState({ connectionState: "disconnected", status: "pending", waConnected: false });
+  setTimeout(() => {
+    console.log("↻ إعادة تشغيل العملية بعد فصل واتساب حتى يسترجع RemoteAuth الجلسة تلقائياً");
+    process.exit(1);
+  }, 1200).unref?.();
 });
+
+setInterval(() => {
+  verifyConnectionState({ persist: true }).catch(() => {});
+}, 15000).unref?.();
 
 // ---- استقبال الرسائل: الرسائل الجديدة فقط (لا استيراد للقديمة) ----
 client.on("message", async (msg) => {
   try {
-    if (!/@c\.us$/.test(msg.from || "")) return; // تجاهل المجموعات/البث/@lid
+    if (!isRealCustomer(msg.from || "")) return; // تجاهل المجموعات/البث فقط، واقبل @c.us و @lid للعملاء
     if (msg.isStatus) return;
     // تجاهل أي رسالة وصلت قبل اكتمال الربط (رسائل قديمة/مزامنة أولية)
     if (readyAtSec && Number(msg.timestamp) && Number(msg.timestamp) < readyAtSec) return;
@@ -142,9 +229,9 @@ client.on("message", async (msg) => {
 // ---- الرسائل الصادرة يدوياً من الهاتف نفسه: حفظ للعرض (الجديدة فقط) ----
 client.on("message_create", async (msg) => {
   if (!msg.fromMe) return;
-  if (!/@c\.us$/.test(msg.to || "")) return;
+  if (!isRealCustomer(msg.to || "")) return;
   if (readyAtSec && Number(msg.timestamp) && Number(msg.timestamp) < readyAtSec) return;
-  const manualKey = `${String(msg.to || "").replace(/@.*/, "")}:${msg.body || ""}`;
+  const manualKey = `${customerIdFromJid(msg.to)}:${msg.body || ""}`;
   if (recentAutoSends.has(manualKey)) return;
   try {
     await saveManualOutgoing(msg);
@@ -182,7 +269,7 @@ botRef()
   );
 
 async function sendOne(doc) {
-  const { phone, text, convMsgId } = doc.data() || {};
+  const { phone, chatId, text, convMsgId } = doc.data() || {};
   if (!phone || !text) {
     await markOutboxError(doc.id, "missing phone/text");
     return;
@@ -195,7 +282,9 @@ async function sendOne(doc) {
     const autoKey = `${phone}:${text}`;
     recentAutoSends.add(autoKey);
     setTimeout(() => recentAutoSends.delete(autoKey), 30000).unref?.();
-    await client.sendMessage(`${phone}@c.us`, text);
+    const destination = chatId || (/^\d{8,15}$/.test(String(phone)) ? `${phone}@c.us` : null);
+    if (!destination) throw new Error("missing chatId for non-phone WhatsApp contact");
+    await client.sendMessage(destination, text);
     await markOutboxSent(doc.id, phone, convMsgId);
     console.log(`→ أُرسلت رسالة إلى ${phone}`);
   } catch (e) {
@@ -258,7 +347,9 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-app.get("/status", (_req, res) => {
+app.get("/status", async (_req, res) => {
+  const live = await verifyConnectionState({ persist: true });
+  const isConnected = connectionState === "connected" && live.connected !== false;
   res.json({
     ok: true,
     service: "whatsapp-bridge",
@@ -267,13 +358,16 @@ app.get("/status", (_req, res) => {
     connectionState,
     status: connectionState,
     connection: connectionState,
-    state: connectionState === "connected" ? "open" : connectionState,
-    connected: connectionState === "connected",
-    ready: connectionState === "connected",
+    state: isConnected ? "open" : connectionState,
+    connected: isConnected,
+    ready: isConnected,
+    waState: live.state || lastWaState,
     hasQr: !!latestQrRaw,
     qr: latestQrRaw,
     qrDataUrl: latestQrDataUrl,
     lastError,
+    remoteSessionSaved,
+    remoteSessionClientId: REMOTE_SESSION_CLIENT_ID,
     readyAtSec,
     newMessageGraceSec: NEW_MESSAGE_GRACE_SEC,
     uptimeSec: Math.floor(process.uptime()),
@@ -287,9 +381,10 @@ app.post("/send", async (req, res) => {
   if (!auth(req)) return res.status(401).json({ error: "unauthorized" });
   try {
     const phone = String(req.body?.phone || "").replace(/\D/g, "");
+    const chatId = String(req.body?.chatId || "").trim() || null;
     const text = String(req.body?.text || req.body?.message || "").trim();
     if (!/^\d{8,15}$/.test(phone) || !text) return res.status(400).json({ ok: false, error: "phone/text required" });
-    const convMsgId = await queueOutgoingMessage(phone, text, { source: "api" });
+    const convMsgId = await queueOutgoingMessage(phone, text, { source: "api", chatId });
     res.json({ ok: true, queued: true, phone, convMsgId });
   } catch (e) {
     lastError = errorMessage(e);
@@ -318,6 +413,7 @@ app.post("/restart", async (req, res) => {
 app.post("/reset-session", async (req, res) => {
   if (!auth(req)) return res.status(401).json({ error: "unauthorized" });
   try {
+    await client.logout().catch(() => {});
     await client.destroy().catch(() => {});
     await fs.rm(path.resolve("./.wwebjs_auth"), { recursive: true, force: true });
     await fs.rm(path.resolve("./.wwebjs_cache"), { recursive: true, force: true });
