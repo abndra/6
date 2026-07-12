@@ -1,7 +1,7 @@
 {
-  "botName": "1",
-  "storeId": "cAGPFqAeV4PUjAPSzUOo",
-  "botId": "pJF4z28Y86j2ytbojUi0",
+  "botName": "6",
+  "storeId": "y7zvFk9TGte1XEQisjNr",
+  "botId": "QJBetBgtgzx9tQ6WqTV8",
   "database": "supabase-documents",
   "filesVersion": "4.2.0",
   "filesVersionNote": "Instant mode: 0.5s queue watchers, fresh bot config on every message, parallel database writes",

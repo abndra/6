@@ -31,13 +31,14 @@ const {
   logEvent,
 } = require("./firestore-writer");
 
-const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+// llama-3.1-8b-instant أسرع بكثير من 70b مع جودة ممتازة للردود القصيرة (يمكن تغييره من Railway env)
+const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
 const STALE_PROCESSING_MS = Number(process.env.AI_STALE_PROCESSING_MS || 120000);
-// السرعة أولاً: الحد الأدنى منخفض جداً بحيث onSnapshot يعمل فوراً و polling يكمل بسرعة كشبكة أمان
-const AI_POLL_INTERVAL_MS = Math.max(250, Number(process.env.AI_POLL_INTERVAL_MS || 500));
+// السرعة أولاً: onSnapshot يلتقط الرسالة فوراً، polling كشبكة أمان بأدنى تأخير
+const AI_POLL_INTERVAL_MS = Math.max(150, Number(process.env.AI_POLL_INTERVAL_MS || 250));
 const AI_RECOVER_INTERVAL_MS = Math.max(15000, Number(process.env.AI_RECOVER_INTERVAL_MS || 30000));
-const AI_GROQ_TIMEOUT_MS = Math.max(5000, Number(process.env.AI_GROQ_TIMEOUT_MS || 25000));
-const AI_MAX_CONCURRENT = Math.max(1, Math.min(10, Number(process.env.AI_MAX_CONCURRENT || 5)));
+const AI_GROQ_TIMEOUT_MS = Math.max(4000, Number(process.env.AI_GROQ_TIMEOUT_MS || 15000));
+const AI_MAX_CONCURRENT = Math.max(1, Math.min(20, Number(process.env.AI_MAX_CONCURRENT || 10)));
 const AI_CONFIG_REFRESH_MS = Math.max(1000, Number(process.env.AI_CONFIG_REFRESH_MS || 5000));
 const AI_HEARTBEAT_WRITE_MS = Math.max(5000, Number(process.env.AI_HEARTBEAT_WRITE_MS || 30000));
 const DEFAULT_CLOSED_MESSAGE = "نعتذر، المتجر مغلق حالياً. سنعود إليك عند الفتح.";
@@ -60,8 +61,8 @@ let botConfig = {
   storeName: "المتجر",
   botName: "المساعد",
   language: "ar",
-  temperature: 0.4,
-  maxTokens: 350,
+  temperature: 0.3,
+  maxTokens: 220,
   workingHours: null,
   offHoursMessage: "",
   humanHandoff: false,
@@ -287,7 +288,7 @@ async function loadHistory(phone) {
   try {
     const snap = await botRef()
       .collection("conversations").doc(phone)
-      .collection("messages").orderBy("timestamp", "desc").limit(8).get();
+      .collection("messages").orderBy("timestamp", "desc").limit(4).get();
     return snap.docs
       .reverse()
       .map((d) => {
@@ -313,9 +314,12 @@ async function isFirstMessage(phone) {
 // معالجة رسالة واحدة من الطابور
 // ============================================================
 async function processJob(phone, body, msgId, chatId = null) {
-  await refreshConfigFromSupabase("message");
+  // إطلاق تحديث الإعدادات وتحميل السياق بالتوازي منذ اللحظة الأولى — أقصى سرعة ممكنة
+  const configPromise = refreshConfigFromSupabase("message").catch(() => {});
+  const historyPromise = loadHistory(phone).catch(() => []);
   const text = (body || "").trim();
   if (!text) return;
+  await configPromise;
 
   // 1) المتجر/البوت مغلق أو خارج ساعات العمل — أعلى أولوية دائماً ولا يتجاوزها أي ذكاء/تحويل.
   if (!botConfig.isOpen) {
@@ -351,7 +355,7 @@ async function processJob(phone, body, msgId, chatId = null) {
 
   // 4) الذكاء الاصطناعي (Groq) مع كامل السياق
   try {
-    const history = await loadHistory(phone);
+    const history = await historyPromise;
     const reply = await askGroq(text, history);
     const finalReply = reply || botConfig.fallbackMessage;
     await queueAiReply(phone, finalReply, { source: "groq", chatId });
