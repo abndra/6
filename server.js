@@ -43,11 +43,15 @@ const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "";
 // نقبل الرسائل القريبة من لحظة الربط حتى لا تُرفض بسبب فرق توقيت واتساب،
 // وفي نفس الوقت لا نستورد المحادثات القديمة جداً.
 const NEW_MESSAGE_GRACE_SEC = Number(process.env.NEW_MESSAGE_GRACE_SEC || 45);
-const REMOTE_SESSION_BACKUP_MS = Math.max(60000, Number(process.env.REMOTE_SESSION_BACKUP_MS || 60000));
+// حفظ جلسة RemoteAuth عملية ضغط/رفع ثقيلة. كل دقيقة كان يسبب تداخل حفظ + استهلاك ذاكرة.
+// خمس دقائق كافية لحفظ الجلسة باستمرار وتمنع OOM على خطط Railway الصغيرة.
+const REMOTE_SESSION_BACKUP_MS = Math.max(60000, Number(process.env.REMOTE_SESSION_BACKUP_MS || 300000));
 const REMOTE_SESSION_CLIENT_ID = String(process.env.REMOTE_SESSION_CLIENT_ID || `${STORE_ID}_${BOT_ID}`).replace(/[^a-z0-9_-]/gi, "_");
 const OUTBOX_POLL_INTERVAL_MS = Math.max(3000, Number(process.env.OUTBOX_POLL_INTERVAL_MS || 5000));
-const MESSAGE_SWEEP_INTERVAL_MS = Math.max(15000, Number(process.env.MESSAGE_SWEEP_INTERVAL_MS || 30000));
-const MESSAGE_SWEEP_LIMIT = Math.max(5, Math.min(30, Number(process.env.MESSAGE_SWEEP_LIMIT || 12)));
+// getChats/fetchMessages يحمّل بيانات كثيرة من واتساب. نجعله شبكة أمان خفيفة فقط، لا فحصاً كل 30 ثانية.
+const MESSAGE_SWEEP_INTERVAL_MS = Math.max(60000, Number(process.env.MESSAGE_SWEEP_INTERVAL_MS || 300000));
+const MESSAGE_SWEEP_LIMIT = Math.max(3, Math.min(10, Number(process.env.MESSAGE_SWEEP_LIMIT || 5)));
+const WA_STATE_TIMEOUT_MS = Math.max(3000, Number(process.env.WA_STATE_TIMEOUT_MS || 7000));
 
 // ---- عميل واتساب ----
 const client = new Client({
@@ -69,6 +73,9 @@ const client = new Client({
       "--disable-extensions",
       "--no-first-run",
       "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
+      "--js-flags=--max-old-space-size=128",
     ],
   },
 });
@@ -80,6 +87,7 @@ let lastWaState = null;
 let lastError = null;
 let remoteSessionSaved = false;
 let savingRemoteSession = false;
+let statusVerifyInFlight = null;
 const recentAutoSends = new Set();
 // وقت اكتمال الربط — نتجاهل أي رسالة أقدم منه حتى لا نستورد المحادثات القديمة.
 let readyAtSec = 0;
@@ -93,10 +101,41 @@ function isHealthyWaState(state) {
   return ["CONNECTED", "OPEN", "PAIRING", "TIMEOUT"].includes(value);
 }
 
+function installRemoteSessionSaveLock() {
+  const strategy = client.authStrategy;
+  if (!strategy || typeof strategy.storeRemoteSession !== "function" || strategy.__taysirSaveLockInstalled) return;
+  const originalStoreRemoteSession = strategy.storeRemoteSession.bind(strategy);
+  let saveChain = Promise.resolve();
+
+  strategy.storeRemoteSession = async (options) => {
+    const run = async () => {
+      try {
+        await originalStoreRemoteSession(options);
+      } catch (error) {
+        lastError = errorMessage(error);
+        console.error("remote session save skipped:", lastError);
+        await setConnectionState({ lastError, remoteSessionSaveErrorAt: admin.firestore.FieldValue.serverTimestamp() }).catch(() => {});
+        // لا نرمي الخطأ هنا: RemoteAuth يستدعي الحفظ من interval داخلي، والرمي كان يصنع
+        // unhandledRejection ويترك العملية بحالة غير مستقرة. سيُعاد الحفظ في الدورة التالية.
+      }
+    };
+
+    const next = saveChain.catch(() => {}).then(run);
+    saveChain = next.catch(() => {});
+    return next;
+  };
+  strategy.__taysirSaveLockInstalled = true;
+}
+
+installRemoteSessionSaveLock();
+
 async function verifyConnectionState({ persist = false } = {}) {
   if (connectionState !== "connected") return { connected: false, state: lastWaState || connectionState };
   try {
-    const state = await client.getState();
+    const state = await Promise.race([
+      client.getState(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("WhatsApp getState timeout")), WA_STATE_TIMEOUT_MS)),
+    ]);
     lastWaState = state || null;
     if (state && !isHealthyWaState(state)) {
       connectionState = "disconnected";
@@ -110,6 +149,15 @@ async function verifyConnectionState({ persist = false } = {}) {
     if (persist) await setConnectionState({ lastError, waState: lastWaState });
     return { connected: connectionState === "connected", state: lastWaState, error: lastError };
   }
+}
+
+function triggerConnectionVerify() {
+  if (statusVerifyInFlight) return;
+  statusVerifyInFlight = verifyConnectionState({ persist: true })
+    .catch(() => {})
+    .finally(() => {
+      statusVerifyInFlight = null;
+    });
 }
 
 async function saveRemoteSessionNow() {
@@ -169,17 +217,8 @@ client.on("ready", async () => {
     waState: lastWaState,
   });
 
-  // RemoteAuth يحفظ تلقائياً بعد دقيقة، لكن نحاول نسخة مبكرة أيضاً حتى لا تضيع
-  // الجلسة لو أعاد Railway التشغيل مباشرة بعد الربط.
-  [15000, 35000, 65000].forEach((delayMs) => {
-    setTimeout(async () => {
-      try {
-        if (!remoteSessionSaved || delayMs >= 65000) await saveRemoteSessionNow();
-      } catch (error) {
-        console.error("early remote session save failed:", errorMessage(error));
-      }
-    }, delayMs).unref?.();
-  });
+  // RemoteAuth يحفظ أول نسخة مستقرة بعد دقيقة ثم دورياً. الحفظ المبكر المتكرر كان
+  // يتداخل مع الحفظ الداخلي ويولد ENOENT لملف RemoteAuth zip، لذلك نتركه مقفلاً ومتسلسلاً.
 });
 
 client.on("remote_session_saved", async () => {
@@ -209,7 +248,7 @@ client.on("disconnected", async (reason) => {
 });
 
 setInterval(() => {
-  verifyConnectionState({ persist: true }).catch(() => {});
+  triggerConnectionVerify();
 }, 15000).unref?.();
 
 async function handleIncomingMessage(msg, source = "event") {
@@ -282,6 +321,10 @@ client.initialize().catch(async (error) => {
   connectionState = "init_error";
   console.error("client.initialize failed:", lastError);
   await setConnectionState({ connectionState: "init_error", status: "pending", waConnected: false, lastError }).catch(() => {});
+  setTimeout(() => {
+    console.log("↻ إعادة تشغيل العملية بعد فشل تهيئة واتساب");
+    process.exit(1);
+  }, 3000).unref?.();
 });
 
 // ============================================================
@@ -412,8 +455,8 @@ app.get("/health", async (_req, res) => {
 });
 
 app.get("/status", async (_req, res) => {
-  const live = await verifyConnectionState({ persist: true });
-  const isConnected = connectionState === "connected" && live.connected !== false;
+  triggerConnectionVerify();
+  const isConnected = connectionState === "connected";
   res.json({
     ok: true,
     service: "whatsapp-bridge",
@@ -425,7 +468,7 @@ app.get("/status", async (_req, res) => {
     state: isConnected ? "open" : connectionState,
     connected: isConnected,
     ready: isConnected,
-    waState: live.state || lastWaState,
+    waState: lastWaState,
     hasQr: !!latestQrRaw,
     qr: latestQrRaw,
     qrDataUrl: latestQrDataUrl,

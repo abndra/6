@@ -3,8 +3,8 @@
   "storeId": "RTdIAtwTwu2FKViEzbBe",
   "botId": "sF8d1BUjlJGEqZlUSN22",
   "firestoreDatabaseId": "default",
-  "filesVersion": "3.3.0",
-  "filesVersionNote": "Always-on AI/outbox watchdogs + persistent WhatsApp RemoteAuth + @lid customer support",
+  "filesVersion": "3.4.0",
+  "filesVersionNote": "Memory-safe RemoteAuth session streaming + locked session saves + lighter WhatsApp watchdogs",
   "architecture": "whatsapp-bridge + firestore aiQueue/outbox + groq ai-worker + firestore remote session",
   "messages": "الرسائل الجديدة فقط بعد الربط — لا استيراد للمحادثات القديمة",
   "endpoints": [
