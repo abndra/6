@@ -33,12 +33,13 @@ const {
 const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 const STALE_PROCESSING_MS = Number(process.env.AI_STALE_PROCESSING_MS || 120000);
 // السرعة أولاً: الحد الأدنى منخفض جداً بحيث onSnapshot يعمل فوراً و polling يكمل بسرعة كشبكة أمان
-const AI_POLL_INTERVAL_MS = Math.max(1000, Number(process.env.AI_POLL_INTERVAL_MS || 2000));
+const AI_POLL_INTERVAL_MS = Math.max(250, Number(process.env.AI_POLL_INTERVAL_MS || 500));
 const AI_RECOVER_INTERVAL_MS = Math.max(15000, Number(process.env.AI_RECOVER_INTERVAL_MS || 30000));
 const AI_GROQ_TIMEOUT_MS = Math.max(5000, Number(process.env.AI_GROQ_TIMEOUT_MS || 25000));
 const AI_MAX_CONCURRENT = Math.max(1, Math.min(10, Number(process.env.AI_MAX_CONCURRENT || 5)));
-const AI_CONFIG_REFRESH_MS = Math.max(15000, Number(process.env.AI_CONFIG_REFRESH_MS || 60000));
-const AI_HEARTBEAT_WRITE_MS = Math.max(30000, Number(process.env.AI_HEARTBEAT_WRITE_MS || 120000));
+const AI_CONFIG_REFRESH_MS = Math.max(1000, Number(process.env.AI_CONFIG_REFRESH_MS || 5000));
+const AI_HEARTBEAT_WRITE_MS = Math.max(5000, Number(process.env.AI_HEARTBEAT_WRITE_MS || 30000));
+const DEFAULT_CLOSED_MESSAGE = "نعتذر، المتجر مغلق حالياً. سنعود إليك عند الفتح.";
 
 // ---- إعدادات البوت الحيّة (تُحدّث دورياً من Supabase) ----
 let botConfig = {
@@ -105,8 +106,8 @@ function mergeConfig(d = {}, secrets = {}, store = {}) {
   };
 }
 
-async function refreshConfig(d) {
-  const [secrets, store] = await Promise.all([readBotSecrets(), readStoreConfig()]);
+async function refreshConfig(d, options = {}) {
+  const [secrets, store] = await Promise.all([readBotSecrets(options), readStoreConfig(options)]);
   mergeConfig(d, secrets, store);
   console.log(
     "✓ إعدادات الذكاء محدّثة | Groq key:",
@@ -125,7 +126,7 @@ async function refreshConfig(d) {
 async function refreshConfigFromSupabase(reason = "interval") {
   try {
     const botSnap = await botRef().get();
-    await refreshConfig(botSnap.exists ? botSnap.data() : {});
+    await refreshConfig(botSnap.exists ? botSnap.data() : {}, { force: reason === "message" || reason === "config-listener" });
   } catch (e) {
     console.error(`config refresh failed (${reason}):`, e.message);
     // لا نفرّغ الإعدادات عند نفاد الكوتا؛ نكمل بآخر إعداد محفوظ في الذاكرة.
@@ -293,6 +294,7 @@ async function isFirstMessage(phone) {
 // معالجة رسالة واحدة من الطابور
 // ============================================================
 async function processJob(phone, body, msgId, chatId = null) {
+  await refreshConfigFromSupabase("message");
   const text = (body || "").trim();
   if (!text) return;
 
@@ -303,9 +305,10 @@ async function processJob(phone, body, msgId, chatId = null) {
   }
 
   // 1) المتجر/البوت مغلق أو خارج ساعات العمل
-  if (!botConfig.isOpen && botConfig.closedMessage) {
-    await queueAiReply(phone, botConfig.closedMessage, { source: "closed", chatId });
-    await markIncomingAiDone(phone, msgId, { aiResponse: botConfig.closedMessage, aiSource: "closed" });
+  if (!botConfig.isOpen) {
+    const closed = botConfig.closedMessage || botConfig.offHoursMessage || DEFAULT_CLOSED_MESSAGE;
+    await queueAiReply(phone, closed, { source: "closed", chatId });
+    await markIncomingAiDone(phone, msgId, { aiResponse: closed, aiSource: "closed" });
     return;
   }
   if (!isWithinWorkingHours() && botConfig.offHoursMessage) {

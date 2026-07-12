@@ -45,8 +45,8 @@ const now = () => FieldValue.serverTimestamp();
 // تقليل استهلاك قاعدة البيانات: لا نسجل أحداثاً تفصيلية إلا عند تفعيلها صراحة،
 // ونحتفظ بإعدادات البوت في الذاكرة حتى لا ينهار الرد عند ضغط/انقطاع مؤقت في الكوتا.
 const EVENT_LOG_ENABLED = String(process.env.EVENT_LOG_ENABLED || "false").toLowerCase() === "true";
-const CONFIG_CACHE_MS = Math.max(60_000, Number(process.env.SUPABASE_CONFIG_CACHE_MS || process.env.FIRESTORE_CONFIG_CACHE_MS || 600_000));
-const CONNECTION_STATE_MIN_WRITE_MS = Math.max(15_000, Number(process.env.CONNECTION_STATE_MIN_WRITE_MS || 60_000));
+const CONFIG_CACHE_MS = Math.max(0, Number(process.env.SUPABASE_CONFIG_CACHE_MS || process.env.FIRESTORE_CONFIG_CACHE_MS || 1000));
+const CONNECTION_STATE_MIN_WRITE_MS = Math.max(1000, Number(process.env.CONNECTION_STATE_MIN_WRITE_MS || 5000));
 let botSecretsCache = { data: null, expiresAt: 0, lastErrorLogAt: 0 };
 let storeConfigCache = { data: null, expiresAt: 0, lastErrorLogAt: 0 };
 let lastConnectionStateWriteAt = 0;
@@ -78,6 +78,18 @@ async function readCachedDoc(ref, cache, label) {
       return cache.data;
     }
     return {};
+  }
+}
+
+async function readFreshDoc(ref, cache, label) {
+  try {
+    const snap = await ref.get();
+    cache.data = snap.exists ? snap.data() : {};
+    cache.expiresAt = Date.now() + CONFIG_CACHE_MS;
+    return cache.data;
+  } catch (e) {
+    logReadFailure(cache, label, e);
+    return cache.data || {};
   }
 }
 
@@ -169,10 +181,8 @@ async function saveIncomingMessage(msg) {
   const convRef = botRef().collection("conversations").doc(phone);
   const msgDoc = convRef.collection("messages").doc(messageDocId);
 
-  // Batch واحد بدون قراءة مسبقة: يقلل قراءات قاعدة البيانات لكل رسالة.
-  const batch = db.batch();
   try {
-    batch.create(msgDoc, {
+    await msgDoc.create({
       from: jid,
       chatId,
       fromMe: false,
@@ -183,8 +193,13 @@ async function saveIncomingMessage(msg) {
       aiStatus: "pending",
       raw: { id: msg.id?._serialized || null },
     });
-    batch.set(
-      convRef,
+  } catch (e) {
+    if (e?.code === 6 || /ALREADY_EXISTS/i.test(String(e?.message || ""))) return null;
+    throw e;
+  }
+
+  await Promise.all([
+    convRef.set(
       {
         phone,
         rawPhone,
@@ -196,16 +211,16 @@ async function saveIncomingMessage(msg) {
         unreadCount: FieldValue.increment(1),
       },
       { merge: true },
-    );
-    batch.set(botRef().collection("messages").doc(messageDocId), {
+    ),
+    botRef().collection("messages").doc(messageDocId).set({
       conversationId: phone,
       chatId,
       fromMe: false,
       body,
       timestamp: now(),
-    });
-    batch.set(botRef(), { messagesCount: FieldValue.increment(1), lastMessageAt: now() }, { merge: true });
-    batch.set(botRef().collection("aiQueue").doc(messageDocId), {
+    }),
+    botRef().set({ messagesCount: FieldValue.increment(1), lastMessageAt: now() }, { merge: true }),
+    botRef().collection("aiQueue").doc(messageDocId).set({
       phone,
       chatId,
       name,
@@ -213,12 +228,8 @@ async function saveIncomingMessage(msg) {
       msgId: msgDoc.id,
       status: "pending",
       createdAt: now(),
-    });
-    await batch.commit();
-  } catch (e) {
-    if (e?.code === 6 || /ALREADY_EXISTS/i.test(String(e?.message || ""))) return null;
-    throw e;
-  }
+    }),
+  ]);
 
   return { phone, name, body, msgId: msgDoc.id };
 }
@@ -288,18 +299,19 @@ async function queueOutgoingMessage(phone, text, { source = "api", chatId = null
     source,
     deliveryStatus: "queued",
   });
-  await convRef.set({ lastMessage: text, updatedAt: now(), ...(chatId ? { chatId } : {}) }, { merge: true });
-
-  // 4.b) طابور الإرسال — خادم واتساب يستمع لهذه المجموعة ويرسل فوراً
-  await botRef().collection("outbox").add({
-    phone,
-    chatId,
-    text,
-    convMsgId: msgDoc.id,
-    status: "pending",
-    createdAt: now(),
-    source,
-  });
+  await Promise.all([
+    convRef.set({ lastMessage: text, updatedAt: now(), ...(chatId ? { chatId } : {}) }, { merge: true }),
+    // 4.b) طابور الإرسال — خادم واتساب يستمع لهذه المجموعة ويرسل فوراً
+    botRef().collection("outbox").add({
+      phone,
+      chatId,
+      text,
+      convMsgId: msgDoc.id,
+      status: "pending",
+      createdAt: now(),
+      source,
+    }),
+  ]);
 
   return msgDoc.id;
 }
@@ -348,12 +360,12 @@ async function setConnectionState(patch, opts = {}) {
 // ============================================================
 // 8) قراءة إعدادات البوت + مفتاح Groq (يستخدمها عامل الذكاء)
 // ============================================================
-async function readBotSecrets() {
-  return readCachedDoc(botSecretsRef(), botSecretsCache, "botSecrets");
+async function readBotSecrets(options = {}) {
+  return options.force ? readFreshDoc(botSecretsRef(), botSecretsCache, "botSecrets") : readCachedDoc(botSecretsRef(), botSecretsCache, "botSecrets");
 }
 
-async function readStoreConfig() {
-  return readCachedDoc(storeRef(), storeConfigCache, "store config");
+async function readStoreConfig(options = {}) {
+  return options.force ? readFreshDoc(storeRef(), storeConfigCache, "store config") : readCachedDoc(storeRef(), storeConfigCache, "store config");
 }
 
 module.exports = {

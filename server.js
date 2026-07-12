@@ -47,13 +47,14 @@ const NEW_MESSAGE_GRACE_SEC = Number(process.env.NEW_MESSAGE_GRACE_SEC || 45);
 // خمس دقائق كافية لحفظ الجلسة باستمرار وتمنع OOM على خطط Railway الصغيرة.
 const REMOTE_SESSION_BACKUP_MS = Math.max(60000, Number(process.env.REMOTE_SESSION_BACKUP_MS || 300000));
 const REMOTE_SESSION_CLIENT_ID = String(process.env.REMOTE_SESSION_CLIENT_ID || `${STORE_ID}_${BOT_ID}`).replace(/[^a-z0-9_-]/gi, "_");
-const OUTBOX_POLL_INTERVAL_MS = Math.max(1000, Number(process.env.OUTBOX_POLL_INTERVAL_MS || 2000));
+const OUTBOX_POLL_INTERVAL_MS = Math.max(250, Number(process.env.OUTBOX_POLL_INTERVAL_MS || 500));
 // getChats/fetchMessages يحمّل بيانات كثيرة من واتساب. نجعله شبكة أمان خفيفة فقط، لا فحصاً كل 30 ثانية.
 const MESSAGE_SWEEP_ENABLED = String(process.env.MESSAGE_SWEEP_ENABLED || "false").toLowerCase() === "true";
 const MESSAGE_SWEEP_INTERVAL_MS = Math.max(300000, Number(process.env.MESSAGE_SWEEP_INTERVAL_MS || 600000));
 const MESSAGE_SWEEP_LIMIT = Math.max(3, Math.min(10, Number(process.env.MESSAGE_SWEEP_LIMIT || 5)));
 const WA_STATE_TIMEOUT_MS = Math.max(3000, Number(process.env.WA_STATE_TIMEOUT_MS || 7000));
 const CONNECTION_VERIFY_INTERVAL_MS = Math.max(30000, Number(process.env.CONNECTION_VERIFY_INTERVAL_MS || 60000));
+const OUTBOX_HEARTBEAT_WRITE_MS = Math.max(5000, Number(process.env.OUTBOX_HEARTBEAT_WRITE_MS || 30000));
 
 // ---- عميل واتساب ----
 const client = new Client({
@@ -91,6 +92,7 @@ let remoteSessionSaved = false;
 let savingRemoteSession = false;
 let statusVerifyInFlight = null;
 const recentAutoSends = new Set();
+let lastOutboxHeartbeatAt = 0;
 // وقت اكتمال الربط — نتجاهل أي رسالة أقدم منه حتى لا نستورد المحادثات القديمة.
 let readyAtSec = 0;
 
@@ -371,11 +373,13 @@ function attachOutboxListener() {
 
 async function drainPendingOutbox(reason = "poll") {
   if (connectionState !== "connected") return;
-  const live = await verifyConnectionState({ persist: true });
-  if (live.connected === false) return;
   const pend = await botRef().collection("outbox").where("status", "==", "pending").limit(10).get();
   pend.forEach((d) => startOutboxDoc(d));
-  await setConnectionState({ outboxHeartbeatAt: admin.firestore.FieldValue.serverTimestamp(), outboxPendingSeen: pend.size, outboxLastDrainReason: reason });
+  const t = Date.now();
+  if (t - lastOutboxHeartbeatAt >= OUTBOX_HEARTBEAT_WRITE_MS) {
+    lastOutboxHeartbeatAt = t;
+    await setConnectionState({ outboxHeartbeatAt: admin.firestore.FieldValue.serverTimestamp(), outboxPendingSeen: pend.size, outboxLastDrainReason: reason });
+  }
 }
 
 attachOutboxListener();

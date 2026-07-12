@@ -25,6 +25,7 @@ const SUPABASE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY ||
   process.env.SUPABASE_SECRET_KEY;
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "";
+const SNAPSHOT_POLL_INTERVAL_MS = Math.max(150, Number(process.env.SNAPSHOT_POLL_INTERVAL_MS || 500));
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   throw new Error(
@@ -305,7 +306,7 @@ function collRef(path, cgroup) {
         } catch (e) {
           if (onError) onError(e);
         } finally {
-          if (!stopped) setTimeout(tick, 3000).unref?.();
+          if (!stopped) setTimeout(tick, SNAPSHOT_POLL_INTERVAL_MS).unref?.();
         }
       };
       setTimeout(tick, 50).unref?.();
