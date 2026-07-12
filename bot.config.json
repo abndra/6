@@ -14,7 +14,9 @@
   ],
   "requiredVariables": [
     "SERVICE_TOKEN",
-    "FIREBASE_SERVICE_ACCOUNT",
+    "FIREBASE_SERVICE_ACCOUNT"
+  ],
+  "embeddedVariables": [
     "TAYSIR_STORE_ID",
     "TAYSIR_BOT_ID"
   ],

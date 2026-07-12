@@ -13,6 +13,7 @@
 
 ```env
 FIREBASE_SERVICE_ACCOUNT=الصق JSON كامل
+# هذان موجودان تلقائياً داخل bot.config.json عند تحميل ZIP بعد حفظ البوت
 TAYSIR_STORE_ID=zj4KW4k2kiInawdlofxD
 TAYSIR_BOT_ID=6fZIB8yfDE2QCzn21JKM
 SERVICE_TOKEN=نفس التوكن في لوحة تيسير

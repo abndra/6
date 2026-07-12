@@ -16,12 +16,21 @@ if (!admin.apps.length) {
   admin.initializeApp({ credential: admin.credential.cert(svc) });
 }
 
+function readEmbeddedConfig() {
+  try {
+    return require('./bot.config.json') || {};
+  } catch {
+    return {};
+  }
+}
+
+const embeddedConfig = readEmbeddedConfig();
 const db = admin.firestore();
 const FieldValue = admin.firestore.FieldValue;
-const STORE_ID = process.env.TAYSIR_STORE_ID;
-const BOT_ID = process.env.TAYSIR_BOT_ID;
+const STORE_ID = process.env.TAYSIR_STORE_ID || embeddedConfig.storeId;
+const BOT_ID = process.env.TAYSIR_BOT_ID || embeddedConfig.botId;
 
-if (!STORE_ID || !BOT_ID) throw new Error('TAYSIR_STORE_ID / TAYSIR_BOT_ID are required in Railway Variables');
+if (!STORE_ID || !BOT_ID) throw new Error('TAYSIR_STORE_ID / TAYSIR_BOT_ID missing. Download fresh GitHub files after saving the bot, or add both IDs in Railway Variables.');
 
 const botRef = () => db.collection('stores').doc(STORE_ID).collection('bots').doc(BOT_ID);
 const now = () => FieldValue.serverTimestamp();
