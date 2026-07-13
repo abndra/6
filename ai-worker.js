@@ -192,12 +192,24 @@ async function mergeConfig(d = {}, secrets = {}, store = {}) {
   const botName = textValue(d.name, store.botName, "المساعد");
   const defaultPersona = `أنت ${botName}، مساعد ذكي لمتجر ${storeName}. رد بلغة العميل باختصار ووضوح، واعتمد فقط على معلومات المتجر المحفوظة.`;
   const groqKeys = await buildGroqKeysList(secrets, d);
+  const prevFingerprint = botConfig?.configFingerprint || "";
+  // حساب نفاد التوكنات — نفس منطق src/lib/tokens.ts
+  const tokensTotal = Math.max(0, Number(d.tokensTotal ?? 0));
+  const tokensManualUsed = Math.max(0, Number(d.tokensManualUsed ?? 0));
+  const msgs = Math.max(0, Number(d.messagesCount ?? 0));
+  const msgsRead = Math.round(msgs / 2);
+  const msgsSent = msgs - msgsRead;
+  const usedFromMessages = msgsRead * 0.075 + msgsSent * 0.075;
+  const tokensUsed = Math.min(tokensTotal, usedFromMessages + tokensManualUsed);
+  const tokensDepleted = tokensTotal > 0 && (tokensTotal - tokensUsed) <= 0;
   botConfig = {
     greeting: textValue(d.greeting, store.greeting),
     closedMessage: textValue(d.closedMessage, d.offHoursMessage, store.closedMessage, store.offHoursMessage),
     fallbackMessage: textValue(d.fallbackMessage, store.fallbackMessage, "تم استلام رسالتك، وسنرد عليك قريباً. جرّب إرسال رسالتك مرة أخرى بصياغة مختلفة."),
     isOpen: d.isOpen !== false && d.active !== false && store.isOpen !== false,
     paused: !!(d.paused || store.paused),
+    tokensDepleted,
+    aiBlockedPhones: asArray(d.aiBlockedPhones).map((v) => String(v || "").trim()).filter(Boolean),
     persona: textValue(d.persona, store.persona, defaultPersona),
     systemInstructions: textValue(d.systemInstructions, store.systemInstructions),
     tone: textValue(d.tone, store.tone, botConfig.tone),
@@ -231,6 +243,27 @@ async function mergeConfig(d = {}, secrets = {}, store = {}) {
     storeAddress: textValue(d.storeAddress, store.address, store.storeAddress),
     storeWebsite: textValue(d.storeWebsite, store.website, store.storeWebsite),
   };
+  // بصمة الإعدادات: أي تغيير في هذه الحقول يبطل الكاش فوراً
+  const fpParts = [
+    botConfig.dialect, botConfig.tone, botConfig.role, botConfig.emojiLevel,
+    botConfig.persona, botConfig.systemInstructions, botConfig.basePromptOverride,
+    botConfig.language, botConfig.charLimit,
+    JSON.stringify(botConfig.rules || []),
+    JSON.stringify(botConfig.paymentMethods || []),
+    JSON.stringify(botConfig.quickReplies || []),
+    JSON.stringify(botConfig.faqs || []),
+    JSON.stringify((botConfig.knowledge || []).map((k) => `${k?.title || ""}:${k?.content || ""}`)),
+    JSON.stringify((botConfig.products || []).map((p) => `${p?.name || ""}:${p?.price || ""}`)),
+    String(d.settingsUpdatedAt || d.updatedAt || ""),
+  ];
+  let hash = 0;
+  const src = fpParts.join("|");
+  for (let i = 0; i < src.length; i++) hash = ((hash << 5) - hash + src.charCodeAt(i)) | 0;
+  botConfig.configFingerprint = String(hash);
+  if (prevFingerprint && prevFingerprint !== botConfig.configFingerprint) {
+    responseCache.clear();
+    console.log("✓ تغيّرت الإعدادات — تم مسح كاش الردود لتطبيق التغييرات فوراً");
+  }
 }
 
 async function refreshConfig(d, options = {}) {
@@ -467,7 +500,8 @@ function clampText(value, limit = AI_PROMPT_TEXT_LIMIT) {
 }
 
 function cacheKeyFor(text) {
-  return normalize(text).slice(0, 180);
+  const fp = botConfig.configFingerprint || "0";
+  return `${fp}::${normalize(text).slice(0, 180)}`;
 }
 
 function getCachedReply(text) {
@@ -1362,8 +1396,19 @@ async function processJob(phone, body, msgId, chatId = null) {
 
   // 1) المتجر/البوت مغلق أو خارج ساعات العمل — أعلى أولوية دائماً ولا يتجاوزها أي ذكاء/تحويل.
   // 0) الوكيل موقوف يدوياً من زر ON/OFF في لوحة التحكم — تجاهل الرسالة بصمت
+  // 0) البوت مقفل بسبب نفاد التوكنات — تجاهل الرسالة بصمت (كأن البوت متوقف)
+  if (botConfig.tokensDepleted) {
+    await markIncomingAiDone(phone, msgId, { aiResponse: null, aiSource: "tokens_depleted" });
+    return;
+  }
+  // 0) الوكيل موقوف يدوياً من زر ON/OFF في لوحة التحكم — تجاهل الرسالة بصمت
   if (botConfig.paused) {
     await markIncomingAiDone(phone, msgId, { aiResponse: null, aiSource: "paused" });
+    return;
+  }
+  // 0) المستخدم محظور من الذكاء يدوياً من لوحة الوارد — تجاهل الرسالة بصمت
+  if ((botConfig.aiBlockedPhones || []).includes(String(phone))) {
+    await markIncomingAiDone(phone, msgId, { aiResponse: null, aiSource: "ai_blocked" });
     return;
   }
   if (!botConfig.isOpen) {
