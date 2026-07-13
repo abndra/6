@@ -102,6 +102,10 @@ let botConfig = {
   offHoursMessage: "",
   humanHandoff: false,
   humanHandoffTrigger: "",
+  paymentMethods: [],
+  orderRequiredFields: ["items", "customerName", "contactPhone", "deliveryType", "deliveryTime"],
+  storeAddress: "",
+  storeWebsite: "",
 };
 let lastAiHeartbeatAt = 0;
 
@@ -154,6 +158,12 @@ function mergeConfig(d = {}, secrets = {}, store = {}) {
     offHoursMessage: textValue(d.offHoursMessage, d.closedMessage, store.offHoursMessage, store.closedMessage),
     humanHandoff: !!(d.humanHandoff || store.humanHandoff),
     humanHandoffTrigger: textValue(d.humanHandoffTrigger, store.humanHandoffTrigger),
+    paymentMethods: asArray(d.paymentMethods).length ? asArray(d.paymentMethods) : asArray(store.paymentMethods),
+    orderRequiredFields: asArray(d.orderRequiredFields).length
+      ? asArray(d.orderRequiredFields)
+      : ["items", "customerName", "contactPhone", "deliveryType", "deliveryTime"],
+    storeAddress: textValue(d.storeAddress, store.address, store.storeAddress),
+    storeWebsite: textValue(d.storeWebsite, store.website, store.storeWebsite),
   };
 }
 
@@ -417,21 +427,85 @@ function buildSystemPrompt() {
   if (botConfig.rules.length) {
     parts.push("\n=== قوانين يجب الالتزام بها ===\n" + botConfig.rules.map((r, i) => `${i + 1}. ${r}`).join("\n"));
   }
-  if (botConfig.knowledge.length) {
-    parts.push("\n=== قاعدة معرفة المتجر ===\n" + botConfig.knowledge.map((k) => `• ${k.title}: ${k.content}`).join("\n"));
-  }
+
+  // 🛒 المخزون هو المصدر الوحيد لأسئلة "شو عندكم / منتجاتكم / الأسعار"
   if (botConfig.products.length) {
-    parts.push("\n=== المنتجات والأسعار ===\n" + botConfig.products.map((p) => `• ${p.name}${p.price ? ` (${p.price})` : ""}: ${p.description || ""}`).join("\n"));
+    parts.push(
+      "\n=== 🛒 المنتجات المتوفرة (المخزون — المصدر الوحيد للأسعار والمنتجات) ===\n" +
+      botConfig.products.map((p) => {
+        const price = p.price != null && p.price !== "" ? ` — السعر: ${p.price}` : "";
+        const cat = p.category ? ` [${p.category}]` : "";
+        const desc = p.description ? ` — ${p.description}` : "";
+        return `• ${p.name}${cat}${price}${desc}`;
+      }).join("\n") +
+      "\n\n⛔ صارم: عند سؤال العميل عن المنتجات/الأسعار/ما هو المتوفر، اعتمد فقط على القائمة أعلاه. لا تخترع منتجاً غير موجود فيها، ولا تنقل منتجات من قاعدة المعرفة إلى الرد كأنها متوفرة. إذا سأل عن منتج غير موجود قل بوضوح: «هذا المنتج غير متوفر عندنا حالياً»."
+    );
+  } else {
+    parts.push("\n=== 🛒 المنتجات ===\nلا توجد منتجات مسجلة بعد في المخزون. إذا سأل العميل عن المنتجات قل: «لم يتم إضافة منتجات بعد، تواصل معنا لاحقاً».");
+  }
+
+  if (botConfig.knowledge.length) {
+    parts.push("\n=== 📚 قاعدة المعرفة (سياسات/معلومات عامة عن المتجر فقط — ليست مصدراً للمنتجات) ===\n" + botConfig.knowledge.map((k) => `• ${k.title}: ${k.content}`).join("\n"));
   }
   if (botConfig.faqs.length) {
     parts.push("\n=== أسئلة شائعة ===\n" + botConfig.faqs.map((f) => `س: ${f.q}\nج: ${f.a}`).join("\n"));
   }
+
+  // 🧾 بروتوكول الطلبات الصارم
+  const requiredLabels = {
+    items: "المنتجات المطلوبة (بالاسم والكمية)",
+    customerName: "اسم العميل",
+    contactPhone: "رقم التواصل (يمكن إرسال «نفس هذا الرقم» ويُقبل)",
+    deliveryType: "استلام أم توصيل",
+    deliveryTime: "وقت الاستلام/التوصيل المطلوب",
+    address: "العنوان (فقط إذا كان توصيلاً)",
+    paymentMethod: "طريقة الدفع",
+    notes: "ملاحظات إضافية (اختياري)",
+  };
+  const needsPayment = asArray(botConfig.paymentMethods).length > 0;
+  const requiredFields = [...asArray(botConfig.orderRequiredFields)];
+  if (needsPayment && !requiredFields.includes("paymentMethod")) requiredFields.push("paymentMethod");
+
+  parts.push(
+    "\n=== 🧾 بروتوكول الطلبات (إلزامي حرفياً) ===\n" +
+    "عندما يعبّر العميل عن رغبته في طلب/شراء منتج، اتبع هذه الخطوات بدون استثناء:\n" +
+    "1) لا تؤكد الطلب أبداً قبل جمع جميع المعلومات المطلوبة أدناه.\n" +
+    "2) اجمع المعلومات على دفعات قصيرة (سؤال أو سؤالين في كل رد). لا تسأل كل شيء دفعة واحدة.\n" +
+    "3) عند اكتمال المعلومات، أرسل رداً واحداً بهذا الشكل:\n" +
+    "   «تأكيد الطلب ✅\n   • المنتجات: …\n   • الاسم: …\n   • رقم التواصل: …\n   • النوع: توصيل/استلام\n   • الوقت: …\n" +
+    (needsPayment ? "   • طريقة الدفع: …\n" : "") +
+    "   • ملاحظات: …\n   شكراً لك، طلبك مسجّل.»\n" +
+    "4) لا تكرر تسجيل نفس الطلب في نفس المحادثة إذا سبق تأكيده. إذا سأل العميل «شو عندكم» بعد التأكيد، اعرض المنتجات فقط بدون فتح طلب جديد.\n\n" +
+    "المعلومات المطلوبة قبل التأكيد:\n" +
+    requiredFields.map((f) => `- ${requiredLabels[f] || f}`).join("\n")
+  );
+
+  if (needsPayment) {
+    parts.push(
+      "\n=== 💳 طرق الدفع المتاحة ===\n" +
+      botConfig.paymentMethods.map((m) => `• ${typeof m === "string" ? m : (m.label || m.name || "")}`).filter(Boolean).join("\n") +
+      "\nإذا لم يذكر العميل طريقة الدفع، اسأله عنها قبل تأكيد الطلب. لا تقترح طريقة دفع غير موجودة في القائمة أعلاه."
+    );
+  } else {
+    parts.push("\n=== 💳 طرق الدفع ===\nلم يتم تفعيل طرق دفع محددة، لذا لا تسأل العميل عن طريقة الدفع، واعتبر الدفع نقداً افتراضياً.");
+  }
+
+  // 🚨 البلاغات والتقييمات
+  parts.push(
+    "\n=== 🚨 البلاغات والشكاوى ===\n" +
+    "إذا قدّم العميل شكوى أو بلاغاً عن موظف/خدمة/منتج، اجمع منه: (أ) ملخص المشكلة، (ب) اسم الموظف إن ذُكر، (ج) وقت الحادثة تقريباً، (د) ما يقترحه لحلها. ثم أكّد له: «تم تسجيل بلاغك برقم داخلي وسنتواصل معك للمتابعة، شكراً على تنبيهنا.»"
+  );
+  parts.push(
+    "\n=== ⭐ التقييمات ===\n" +
+    "إذا أراد العميل تقييم الخدمة، اسأله: (أ) كم نجمة من 5؟ (ب) ما تعليقك؟ ولا تسجّل التقييم قبل أن تحصل على النجوم صراحةً."
+  );
+
   const charLimit = botConfig.charLimit || 500;
-  parts.push(`\n=== تعليمات إلزامية ===\n- لا تتجاوز ${charLimit} حرف في أي رد.\n- لا تخترع معلومات غير موجودة في السياق أعلاه.\n- كن مباشراً ومفيداً.`);
+  parts.push(`\n=== تعليمات إلزامية عامة ===\n- لا تتجاوز ${charLimit} حرف في أي رد.\n- لا تخترع معلومات غير موجودة في السياق أعلاه.\n- لا تخترع كلمات عربية غير موجودة (مثل «ما بشكل»)؛ إن لم تجد الكلمة الصحيحة في قاموس اللهجة، استخدم كلمة بديلة موجودة فيه.\n- كن مباشراً ومفيداً.`);
 
   // تذكير أخير باللهجة في نهاية البرومبت — النماذج تعطي وزناً أكبر للتعليمات القريبة من نهاية system
   if (botConfig.dialect && DIALECT_MAP[botConfig.dialect] && botConfig.dialect !== "auto") {
-    parts.push(`\n🔴 تذكير أخير: ردّك القادم يجب أن يكون حصراً باللهجة (${botConfig.dialect}). لا تستخدم الفصحى.`);
+    parts.push(`\n🔴 تذكير أخير: ردّك القادم يجب أن يكون حصراً باللهجة (${botConfig.dialect}). لا تستخدم الفصحى ولا تخترع كلمات.`);
   }
   return parts.join("\n");
 }
@@ -533,20 +607,62 @@ async function maybeSendProductImage(phone, chatId, replyText) {
 }
 
 // ============================================================
-// استخراج الأنشطة (طلب/تقييم/اقتراح) من التبادل الأخير — Groq خفيف في الخلفية
+// استخراج الأنشطة (طلب/تقييم/اقتراح/بلاغ) — يعمل فقط عندما يؤكد البوت طلباً أو
+// تفاعلاً واضحاً، مع منع تكرار نفس الطلب/التقييم/البلاغ في نفس المحادثة القصيرة.
 // ============================================================
+const ORDER_CONFIRM_REGEX = /(تأكيد الطلب|طلبك (?:مسجّل|تسجّل|جاهز|مؤكد)|تم تسجيل طلبك|نجهز(?:ه|ها)? ل?ك|هنجز|بنجهز|نجهزها|سنجهز|رح نحضّرها|هنحضره)/i;
+const RATING_REGEX = /(⭐|\bنجم(?:ة|تين|ات)?\b|تقييم(?:ك)?|من\s*5)/i;
+const COMPLAINT_REGEX = /(شكوى|شكوة|بلاغ|أشتكي|بشتكي|أبلغ|بلّغ|مشكلة (?:مع|في)|أسلوب(?:ه)?\s*(?:سيء|سئ|رديء)|موظف)/i;
+
+async function alreadyLoggedRecently(collectionName, phone, key, windowMinutes = 20) {
+  try {
+    const { botRef: bR } = require("./firestore-writer");
+    const sinceMs = Date.now() - windowMinutes * 60 * 1000;
+    const snap = await bR().collection(collectionName)
+      .where("phone", "==", phone)
+      .where("dedupKey", "==", key)
+      .limit(1).get();
+    if (snap.empty) return false;
+    // Guard: only treat as duplicate if within window
+    const doc = snap.docs[0].data();
+    const created = doc.createdAt;
+    const createdMs = typeof created?.toMillis === "function" ? created.toMillis() : (created instanceof Date ? created.getTime() : Date.now());
+    return createdMs >= sinceMs;
+  } catch { return false; }
+}
+
+function makeDedupKey(...parts) {
+  return parts.map((p) => String(p || "").trim().toLowerCase()).filter(Boolean).join("|").slice(0, 200);
+}
+
 async function extractAndLogActivity(phone, userText, botText, history = []) {
   const key = String(botConfig.groqApiKey || "").trim();
   if (!key) return;
-  const convo = [...history.slice(-4), { role: "user", content: userText }, { role: "assistant", content: botText }]
+
+  // فحص سريع: إذا لم يوجد أي مؤشر (تأكيد طلب/تقييم/بلاغ/اقتراح) في الرد أو الرسالة، لا نُتعب Groq
+  const combined = `${userText}\n${botText}`;
+  const looksLikeOrderConfirm = ORDER_CONFIRM_REGEX.test(botText);
+  const looksLikeRating = RATING_REGEX.test(combined);
+  const looksLikeComplaint = COMPLAINT_REGEX.test(combined);
+  const looksLikeSuggestion = /(اقتراح|أقترح|بقترح|اقترح|تحسين|فكرة)/i.test(userText);
+  if (!looksLikeOrderConfirm && !looksLikeRating && !looksLikeComplaint && !looksLikeSuggestion) return;
+
+  const convo = [...history.slice(-6), { role: "user", content: userText }, { role: "assistant", content: botText }]
     .map((m) => `${m.role === "user" ? "العميل" : "البوت"}: ${m.content}`).join("\n");
-  const sys = `أنت مصنّف. حلّل آخر تبادل بين عميل وبوت متجر واستخرج فقط ما حدث فعلاً. أعد JSON صالحاً حصراً بدون أي شرح:
-{"order":null|{"summary":"وصف مختصر للطلب","items":["اسم","اسم"],"notes":"اختياري"},"rating":null|{"stars":1-5,"comment":"اختياري"},"suggestion":null|{"title":"عنوان قصير","body":"نص الاقتراح"}}
-شروط صارمة:
-- order فقط إذا سجّل العميل طلباً فعلياً وأكّده البوت (كلمات مثل: أريد/بدي/سجل طلبي/نفذ الطلب).
-- rating فقط إذا أعطى العميل تقييماً واضحاً بالنجوم أو رقم من 1 إلى 5.
-- suggestion فقط إذا قدّم العميل اقتراحاً أو ملاحظة تطويرية للمتجر.
-- إن لم يوجد شيء، اجعل الحقل null.`;
+  const sys = `أنت مصنّف ذكي لمحادثات متجر. حلّل التبادل التالي واستخرج ما حدث فعلاً. أعد JSON صالحاً فقط بدون أي شرح:
+{
+ "order": null | {"items":["اسم المنتج"],"quantity":"وصف الكمية","customerName":"","contactPhone":"","deliveryType":"pickup|delivery|","deliveryTime":"","address":"","paymentMethod":"","notes":"","total":"","confirmed":true|false},
+ "rating": null | {"stars":1-5,"comment":""},
+ "suggestion": null | {"title":"","body":""},
+ "complaint": null | {"about":"موظف/منتج/خدمة","subject":"","staffName":"","details":"","desiredAction":""}
+}
+شروط صارمة جداً:
+- order.confirmed = true فقط إذا احتوى ردّ البوت على تأكيد صريح (مثل: "تأكيد الطلب"، "تم تسجيل طلبك"، "بنجهز"، "هنجز"). إذا كان البوت لا يزال يسأل عن معلومات ناقصة، اجعل confirmed=false.
+- لا تعتبر رسالة العميل "شو عندكم" أو "أريد أشوف المنتجات" طلباً.
+- rating فقط إذا أعطى العميل عدد نجوم أو رقم واضح من 1 إلى 5. اجعل comment نص تعليقه.
+- complaint فقط إذا اشتكى العميل صراحةً من موظف/منتج/خدمة أو قال "بلاغ/شكوى".
+- suggestion فقط إذا قدّم فكرة تطوير للمتجر (مثل "زيدوا كذا"، "أقترح كذا").
+- إذا لم يحدث شيء من ذلك، اجعل الحقل null.`;
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10000);
@@ -557,7 +673,7 @@ async function extractAndLogActivity(phone, userText, botText, history = []) {
         model: GROQ_MODEL,
         response_format: { type: "json_object" },
         messages: [{ role: "system", content: sys }, { role: "user", content: convo }],
-        temperature: 0, max_tokens: 300,
+        temperature: 0, max_tokens: 500,
       }),
     });
     clearTimeout(timer);
@@ -568,26 +684,86 @@ async function extractAndLogActivity(phone, userText, botText, history = []) {
     const { botRef: bR, FieldValue: FV } = require("./firestore-writer");
     const now = FV.serverTimestamp();
     const writes = [];
-    if (parsed.order && (parsed.order.summary || parsed.order.items?.length)) {
-      writes.push(bR().collection("orders").add({
-        phone, customerName: phone,
-        summary: parsed.order.summary || "طلب جديد",
-        items: parsed.order.items || [], notes: parsed.order.notes || "",
-        createdAt: now, source: "ai-extract",
-      }));
+
+    // ✅ الطلب — يُسجَّل فقط عند التأكيد + مع كل التفاصيل + بدون تكرار
+    if (parsed.order && parsed.order.confirmed && Array.isArray(parsed.order.items) && parsed.order.items.length) {
+      const items = parsed.order.items.filter(Boolean).map((x) => String(x).trim());
+      const dedupKey = makeDedupKey(phone, items.join(","));
+      const dup = await alreadyLoggedRecently("orders", phone, dedupKey, 30);
+      if (!dup) {
+        const o = parsed.order;
+        const summary = items.join("، ") + (o.quantity ? ` (${o.quantity})` : "");
+        writes.push(bR().collection("orders").add({
+          phone,
+          customerName: o.customerName || "",
+          contactPhone: o.contactPhone || phone,
+          items,
+          quantity: o.quantity || "",
+          deliveryType: o.deliveryType || "",
+          deliveryTime: o.deliveryTime || "",
+          address: o.address || "",
+          paymentMethod: o.paymentMethod || "",
+          notes: o.notes || "",
+          total: o.total || "",
+          summary,
+          status: "new",
+          confirmed: true,
+          dedupKey,
+          createdAt: now,
+          source: "ai-extract",
+        }));
+      }
     }
+
+    // ⭐ التقييم
     if (parsed.rating && parsed.rating.stars) {
-      writes.push(bR().collection("ratings").add({
-        phone, stars: Math.max(1, Math.min(5, Number(parsed.rating.stars) || 0)),
-        comment: parsed.rating.comment || "", createdAt: now, source: "ai-extract",
-      }));
+      const stars = Math.max(1, Math.min(5, Number(parsed.rating.stars) || 0));
+      const comment = String(parsed.rating.comment || "").trim();
+      const dedupKey = makeDedupKey(phone, `rating-${stars}`, comment.slice(0, 60));
+      const dup = await alreadyLoggedRecently("ratings", phone, dedupKey, 60);
+      if (!dup) {
+        writes.push(bR().collection("ratings").add({
+          phone, stars, comment, dedupKey, createdAt: now, source: "ai-extract",
+        }));
+      }
     }
+
+    // 💡 اقتراح
     if (parsed.suggestion && (parsed.suggestion.title || parsed.suggestion.body)) {
-      writes.push(bR().collection("suggestions").add({
-        phone, title: parsed.suggestion.title || "اقتراح",
-        body: parsed.suggestion.body || "", createdAt: now, source: "ai-extract",
-      }));
+      const title = String(parsed.suggestion.title || "اقتراح").slice(0, 80);
+      const body = String(parsed.suggestion.body || "").trim();
+      const dedupKey = makeDedupKey(phone, "suggest", title, body.slice(0, 60));
+      const dup = await alreadyLoggedRecently("suggestions", phone, dedupKey, 60);
+      if (!dup) {
+        writes.push(bR().collection("suggestions").add({
+          phone, title, body, dedupKey, createdAt: now, source: "ai-extract",
+        }));
+      }
     }
+
+    // 🚨 بلاغ / شكوى
+    if (parsed.complaint && (parsed.complaint.subject || parsed.complaint.details)) {
+      const c = parsed.complaint;
+      const subject = String(c.subject || c.about || "بلاغ").slice(0, 120);
+      const details = String(c.details || "").trim();
+      const dedupKey = makeDedupKey(phone, "complaint", subject, details.slice(0, 80));
+      const dup = await alreadyLoggedRecently("complaints", phone, dedupKey, 60);
+      if (!dup) {
+        writes.push(bR().collection("complaints").add({
+          phone,
+          about: c.about || "",
+          subject,
+          staffName: c.staffName || "",
+          details,
+          desiredAction: c.desiredAction || "",
+          status: "new",
+          dedupKey,
+          createdAt: now,
+          source: "ai-extract",
+        }));
+      }
+    }
+
     await Promise.all(writes);
   } catch (e) { /* silent */ }
 }
