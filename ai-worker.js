@@ -199,7 +199,7 @@ async function mergeConfig(d = {}, secrets = {}, store = {}) {
   const msgs = Math.max(0, Number(d.messagesCount ?? 0));
   const msgsRead = Math.round(msgs / 2);
   const msgsSent = msgs - msgsRead;
-  const usedFromMessages = msgsRead * 0.075 + msgsSent * 0.075;
+  const usedFromMessages = msgsRead * 0.0525 + msgsSent * 0.0525;
   const tokensUsed = Math.min(tokensTotal, usedFromMessages + tokensManualUsed);
   const tokensDepleted = tokensTotal > 0 && (tokensTotal - tokensUsed) <= 0;
   botConfig = {
