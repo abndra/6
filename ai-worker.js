@@ -32,7 +32,7 @@ const {
 } = require("./firestore-writer");
 
 // نموذج أذكى بكثير من 8b — يفهم السياق واللهجات بدقة عالية جداً
-const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
 const STALE_PROCESSING_MS = Number(process.env.AI_STALE_PROCESSING_MS || 120000);
 // السرعة أولاً: onSnapshot يلتقط الرسالة فوراً، polling كشبكة أمان بأدنى تأخير
 const AI_POLL_INTERVAL_MS = Math.max(150, Number(process.env.AI_POLL_INTERVAL_MS || 250));
@@ -43,9 +43,6 @@ const AI_CONFIG_REFRESH_MS = Math.max(5000, Number(process.env.AI_CONFIG_REFRESH
 const AI_HEARTBEAT_WRITE_MS = Math.max(5000, Number(process.env.AI_HEARTBEAT_WRITE_MS || 30000));
 const DEFAULT_CLOSED_MESSAGE = "نعتذر، المتجر مغلق حالياً. سنعود إليك عند الفتح.";
 const GROQ_FAST_MODEL = process.env.GROQ_FAST_MODEL || "llama-3.1-8b-instant";
-const GROQ_DAILY_LIMIT_COOLDOWN_MS = Math.max(60000, Number(process.env.GROQ_DAILY_LIMIT_COOLDOWN_MS || 10 * 60 * 1000));
-const GROQ_MIN_RETRY_AFTER_MS = Math.max(5000, Number(process.env.GROQ_MIN_RETRY_AFTER_MS || 30000));
-const AI_FALLBACK_COOLDOWN_MS = Math.max(5000, Number(process.env.AI_FALLBACK_COOLDOWN_MS || 30000));
 const AI_HISTORY_LIMIT = Math.max(0, Math.min(4, Number(process.env.AI_HISTORY_LIMIT || 2)));
 const AI_PROMPT_KNOWLEDGE_LIMIT = Math.max(0, Math.min(8, Number(process.env.AI_PROMPT_KNOWLEDGE_LIMIT || 3)));
 const AI_PROMPT_PRODUCT_LIMIT = Math.max(0, Math.min(30, Number(process.env.AI_PROMPT_PRODUCT_LIMIT || 12)));
@@ -53,9 +50,7 @@ const AI_PROMPT_TEXT_LIMIT = Math.max(80, Number(process.env.AI_PROMPT_TEXT_LIMI
 const AI_RESPONSE_CACHE_MS = Math.max(0, Number(process.env.AI_RESPONSE_CACHE_MS || 5 * 60 * 1000));
 const AI_MAX_MESSAGE_CHARS = Math.max(200, Number(process.env.AI_MAX_MESSAGE_CHARS || 1200));
 
-const groqCircuit = new Map();
 const responseCache = new Map();
-const customerFallbackCooldown = new Map();
 
 // ============================================================
 // 🛡️  البرومبت الأساسي الافتراضي لجميع بوتات تيسير (لا يُكشف أبداً)
@@ -301,32 +296,6 @@ function setCachedReply(text, reply) {
   }
 }
 
-function getGroqCooldown(key) {
-  const state = groqCircuit.get(key);
-  if (!state || state.until <= Date.now()) {
-    if (state) groqCircuit.delete(key);
-    return null;
-  }
-  return state;
-}
-
-function setGroqCooldown(key, until, reason = "rate_limit") {
-  groqCircuit.set(key, { until, reason });
-}
-
-function parseRetryAfterMs(res, bodyText = "") {
-  const header = Number(res?.headers?.get?.("retry-after"));
-  if (Number.isFinite(header) && header > 0) return header * 1000;
-  const match = String(bodyText || "").match(/try again in\s+(?:(\d+)m)?\s*(\d+(?:\.\d+)?)s/i);
-  if (match) return ((Number(match[1] || 0) * 60) + Number(match[2] || 0)) * 1000;
-  return 0;
-}
-
-function isDailyTokenLimit(bodyText = "") {
-  const text = String(bodyText || "");
-  return /tokens per day|TPD|rate_limit_exceeded/i.test(text);
-}
-
 function fallbackReplyFor(userMessage) {
   const text = normalize(userMessage);
   const products = asArray(botConfig.products);
@@ -368,16 +337,6 @@ function fallbackReplyFor(userMessage) {
 }
 
 function shouldSendFallbackNow(phone) {
-  const key = String(phone || "unknown");
-  const now = Date.now();
-  const last = customerFallbackCooldown.get(key) || 0;
-  if (now - last < AI_FALLBACK_COOLDOWN_MS) return false;
-  customerFallbackCooldown.set(key, now);
-  if (customerFallbackCooldown.size > 500) {
-    for (const [k, t] of customerFallbackCooldown) {
-      if (now - t > AI_FALLBACK_COOLDOWN_MS * 4 || customerFallbackCooldown.size > 400) customerFallbackCooldown.delete(k);
-    }
-  }
   return true;
 }
 
@@ -646,18 +605,11 @@ async function askGroq(userMessage, history = []) {
   const cached = getCachedReply(userMessage);
   if (cached) return cached;
 
-  const primaryCooldown = getGroqCooldown(GROQ_MODEL);
-  const models = primaryCooldown ? [GROQ_FAST_MODEL] : [GROQ_MODEL, GROQ_FAST_MODEL].filter((m, i, arr) => m && arr.indexOf(m) === i);
+  // لا يوجد cooldown محلي: نحاول Groq مباشرة في كل رسالة حتى يعمل المفتاح الجديد فور تغييره.
+  const models = [GROQ_MODEL, GROQ_FAST_MODEL].filter((m, i, arr) => m && arr.indexOf(m) === i);
   let lastError = null;
 
   for (const model of models) {
-    const cooldown = getGroqCooldown(model);
-    if (cooldown) {
-      lastError = new Error(`Groq ${model} cooling down: ${cooldown.reason}`);
-      lastError.isRateLimited = true;
-      continue;
-    }
-
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), AI_GROQ_TIMEOUT_MS);
     try {
@@ -685,11 +637,6 @@ async function askGroq(userMessage, history = []) {
         const err = new Error(`Groq ${res.status}: ${bodyText}`);
         err.status = res.status;
         err.isRateLimited = res.status === 429;
-        if (res.status === 429) {
-          const retryAfterMs = Math.max(parseRetryAfterMs(res, bodyText), GROQ_MIN_RETRY_AFTER_MS);
-          const cooldownMs = isDailyTokenLimit(bodyText) ? Math.max(retryAfterMs, GROQ_DAILY_LIMIT_COOLDOWN_MS) : retryAfterMs;
-          setGroqCooldown(model, Date.now() + cooldownMs, isDailyTokenLimit(bodyText) ? "daily_token_limit" : "rate_limit");
-        }
         throw err;
       }
       const j = await res.json();
@@ -800,7 +747,6 @@ function makeDedupKey(...parts) {
 async function extractAndLogActivity(phone, userText, botText, history = []) {
   const key = String(botConfig.groqApiKey || "").trim();
   if (!key) return;
-  if (getGroqCooldown(GROQ_FAST_MODEL) || getGroqCooldown(GROQ_MODEL)) return;
 
   // فحص سريع: إذا لم يوجد أي مؤشر (تأكيد طلب/تقييم/بلاغ/اقتراح) في الرد أو الرسالة، لا نُتعب Groq
   const combined = `${userText}\n${botText}`;
@@ -841,11 +787,6 @@ async function extractAndLogActivity(phone, userText, botText, history = []) {
     });
     clearTimeout(timer);
     if (!res.ok) {
-      const bodyText = await res.text().catch(() => "");
-      if (res.status === 429) {
-        const retryAfterMs = Math.max(parseRetryAfterMs(res, bodyText), GROQ_MIN_RETRY_AFTER_MS);
-        setGroqCooldown(GROQ_FAST_MODEL || GROQ_MODEL, Date.now() + retryAfterMs, "activity_rate_limit");
-      }
       return;
     }
     const j = await res.json();
