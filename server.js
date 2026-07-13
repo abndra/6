@@ -441,6 +441,42 @@ setInterval(() => {
   drainPendingOutbox("interval").catch((e) => console.error("outbox drain error:", e.message));
 }, OUTBOX_POLL_INTERVAL_MS).unref?.();
 
+// تحميل الصورة في Node (مع مهلة وحد أقصى للحجم) بدل MessageMedia.fromUrl —
+// لأن fromUrl يحمّل الصورة داخل متصفح واتساب وقد يعلّق الجلسة أو يقطع الاتصال.
+const IMAGE_FETCH_TIMEOUT_MS = 15000;
+const IMAGE_MAX_BYTES = 5 * 1024 * 1024; // 5MB — أكبر من ذلك قد يُثقل جلسة واتساب
+
+async function loadImageMedia(mediaUrl) {
+  if (/^data:/i.test(mediaUrl)) {
+    const m = mediaUrl.match(/^data:([^;]+);base64,(.+)$/);
+    if (!m) throw new Error("invalid data URL");
+    return new MessageMedia(m[1], m[2], "product.jpg");
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), IMAGE_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(mediaUrl, { signal: controller.signal, redirect: "follow" });
+    if (!res.ok) throw new Error(`image HTTP ${res.status}`);
+    const len = Number(res.headers.get("content-length") || 0);
+    if (len && len > IMAGE_MAX_BYTES) throw new Error(`image too large (${len} bytes)`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > IMAGE_MAX_BYTES) throw new Error(`image too large (${buf.length} bytes)`);
+    let mime = (res.headers.get("content-type") || "").split(";")[0].trim();
+    if (!/^image\//i.test(mime)) mime = "image/jpeg";
+    return new MessageMedia(mime, buf.toString("base64"), "product.jpg");
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// حارس مهلة عام حول أي إرسال حتى لا يعلّق الطابور أبداً.
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timeout`)), ms).unref?.()),
+  ]);
+}
+
 async function sendOne(doc) {
   const data = doc.data() || {};
   const { phone, chatId, text, convMsgId, mediaUrl, type, caption } = data;
@@ -459,18 +495,24 @@ async function sendOne(doc) {
     const destination = chatId || (/^\d{8,15}$/.test(String(phone)) ? `${phone}@c.us` : null);
     if (!destination) throw new Error("missing chatId for non-phone WhatsApp contact");
 
-    if (mediaUrl && (type === "image" || /^data:image|\.(jpe?g|png|webp|gif)(\?|$)/i.test(mediaUrl))) {
-      let media;
-      if (/^data:/i.test(mediaUrl)) {
-        const m = mediaUrl.match(/^data:([^;]+);base64,(.+)$/);
-        if (!m) throw new Error("invalid data URL");
-        media = new MessageMedia(m[1], m[2], "product.jpg");
-      } else {
-        media = await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true });
+    const isImage = mediaUrl && (type === "image" || /^data:image|\.(jpe?g|png|webp|gif)(\?|$)/i.test(mediaUrl));
+    if (isImage) {
+      const cap = caption || text || undefined;
+      try {
+        const media = await loadImageMedia(mediaUrl);
+        await withTimeout(
+          client.sendMessage(destination, media, { caption: cap }),
+          30000,
+          "sendImage",
+        );
+      } catch (imgErr) {
+        // فشل إرسال الصورة يجب ألا يقطع المحادثة — أرسل التعليق كنص بديل
+        console.error("image send failed, falling back to text:", imgErr.message);
+        await logEvent("image_send_fallback", { phone, message: imgErr.message }).catch(() => {});
+        if (cap) await withTimeout(client.sendMessage(destination, cap), 20000, "sendText");
       }
-      await client.sendMessage(destination, media, { caption: caption || text || undefined });
     } else {
-      await client.sendMessage(destination, text);
+      await withTimeout(client.sendMessage(destination, text), 20000, "sendText");
     }
     await markOutboxSent(doc.id, phone, convMsgId);
     console.log(`→ أُرسلت ${mediaUrl ? "صورة" : "رسالة"} إلى ${phone}`);
@@ -480,6 +522,7 @@ async function sendOne(doc) {
     await logEvent("send_error", { phone, message: e.message });
   }
 }
+
 
 
 // عند عودة الاتصال، أعد فحص أي رسائل بقيت pending
