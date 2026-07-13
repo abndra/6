@@ -199,7 +199,8 @@ async function mergeConfig(d = {}, secrets = {}, store = {}) {
   const msgs = Math.max(0, Number(d.messagesCount ?? 0));
   const msgsRead = Math.round(msgs / 2);
   const msgsSent = msgs - msgsRead;
-  const usedFromMessages = msgsRead * 0.0525 + msgsSent * 0.0525;
+  // نفس القيم في src/lib/tokens.ts — تم تخفيضها إلى النصف لتقليل الاستهلاك
+  const usedFromMessages = msgsRead * 0.0375 + msgsSent * 0.0375;
   const tokensUsed = Math.min(tokensTotal, usedFromMessages + tokensManualUsed);
   const tokensDepleted = tokensTotal > 0 && (tokensTotal - tokensUsed) <= 0;
   botConfig = {
@@ -1406,10 +1407,24 @@ async function processJob(phone, body, msgId, chatId = null) {
     await markIncomingAiDone(phone, msgId, { aiResponse: null, aiSource: "paused" });
     return;
   }
-  // 0) المستخدم محظور من الذكاء يدوياً من لوحة الوارد — تجاهل الرسالة بصمت
-  if ((botConfig.aiBlockedPhones || []).includes(String(phone))) {
-    await markIncomingAiDone(phone, msgId, { aiResponse: null, aiSource: "ai_blocked" });
-    return;
+  // 0) المستخدم محظور من الذكاء يدوياً من لوحة الوارد — تجاهل الرسالة بصمت.
+  //    الحظر صارم: يُقارَن معرّف العميل الكامل (يعمل مع @c.us و @lid)
+  //    وأيضاً الأرقام المجرّدة (للتوافق مع البيانات القديمة).
+  {
+    const list = (botConfig.aiBlockedPhones || []).map((v) => String(v || "").trim()).filter(Boolean);
+    const phoneStr = String(phone || "").trim();
+    const phoneDigits = phoneStr.replace(/\D/g, "");
+    const chatIdStr = String(chatId || "").trim();
+    const chatDigits = chatIdStr.replace(/@.*/, "").replace(/\D/g, "");
+    const blocked =
+      list.includes(phoneStr) ||
+      (phoneDigits && list.includes(phoneDigits)) ||
+      (chatIdStr && list.includes(chatIdStr)) ||
+      (chatDigits && list.includes(chatDigits));
+    if (blocked) {
+      await markIncomingAiDone(phone, msgId, { aiResponse: null, aiSource: "ai_blocked" });
+      return;
+    }
   }
   if (!botConfig.isOpen) {
     const closed = botConfig.closedMessage || botConfig.offHoursMessage || DEFAULT_CLOSED_MESSAGE;
