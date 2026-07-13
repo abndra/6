@@ -169,8 +169,16 @@ function installRemoteSessionSaveLock() {
       try {
         await originalStoreRemoteSession(options);
       } catch (error) {
-        lastError = errorMessage(error);
-        console.error("remote session save skipped:", lastError);
+        const message = errorMessage(error);
+        // خطأ ناعم متوقع: ملف الـ zip لم يجهز بعد (تهيئة المتصفح/أول دقائق بعد الربط).
+        // نتخطّاه بهدوء دون تلويث حالة الاتصال — الحفظ ينجح في الدورة التالية.
+        const isBenign = error?.benign || error?.name === "SessionZipNotReadyError" || /ENOENT/.test(message);
+        if (isBenign) {
+          console.log("ℹ️ تأجيل حفظ الجلسة (لم يجهز ملف النسخة بعد) — ستُحفظ في الدورة التالية");
+          return;
+        }
+        lastError = message;
+        console.error("remote session save skipped:", message);
         await setConnectionState({ lastError, remoteSessionSaveErrorAt: admin.firestore.FieldValue.serverTimestamp() }).catch(() => {});
         // لا نرمي الخطأ هنا: RemoteAuth يستدعي الحفظ من interval داخلي، والرمي كان يصنع
         // unhandledRejection ويترك العملية بحالة غير مستقرة. سيُعاد الحفظ في الدورة التالية.

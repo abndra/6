@@ -7,7 +7,36 @@
 // ============================================================
 
 const fs = require("fs/promises");
+const path = require("path");
 const { botRef, FieldValue } = require("./firestore-writer");
+
+// خطأ ناعم: ملف الـ zip لم يجهز بعد (تهيئة المتصفح/الجلسة). ليس عطلاً حقيقياً.
+class SessionZipNotReadyError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "SessionZipNotReadyError";
+    this.benign = true;
+  }
+}
+
+async function fileExists(p) {
+  try {
+    await fs.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ننتظر ظهور ملف الـ zip الذي تنشئه RemoteAuth قبل رفعه. في أول دقائق بعد الربط
+// قد يتأخر إنشاؤه لحظة، فبدل الفشل الفوري (ENOENT) ننتظر قليلاً ثم نقرأه.
+async function waitForZip(zipPath, { tries = 8, delayMs = 400 } = {}) {
+  for (let i = 0; i < tries; i += 1) {
+    if (await fileExists(zipPath)) return true;
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+  return false;
+}
 
 function safeSessionId(session) {
   return String(session || "default").replace(/[^a-z0-9_-]/gi, "_");
@@ -32,7 +61,14 @@ class FirestoreRemoteStore {
 
   async save({ session }) {
     const ref = sessionRef(session);
-    const zipPath = `${session}.zip`;
+    // نحسم المسار المطلق بالنسبة لمجلد العمل حتى لا يختلف عن حيث تنشئه RemoteAuth.
+    const zipPath = path.resolve(process.cwd(), `${session}.zip`);
+    // ننتظر ظهور الملف بدل الفشل فوراً بـ ENOENT في أول دقائق بعد الربط.
+    const ready = await waitForZip(zipPath);
+    if (!ready) {
+      // خطأ ناعم: ستُعاد المحاولة في دورة النسخ الاحتياطي التالية بنجاح.
+      throw new SessionZipNotReadyError(`session zip not ready yet: ${session}.zip`);
+    }
     const buf = await fs.readFile(zipPath);
     const blob = buf.toString("base64");
     await ref.set(
@@ -46,6 +82,7 @@ class FirestoreRemoteStore {
       { merge: true },
     );
   }
+
 
   async extract({ session, path }) {
     const ref = sessionRef(session);
@@ -70,4 +107,4 @@ async function deleteRemoteSessionById(session) {
   await sessionRef(session).delete().catch(() => {});
 }
 
-module.exports = { createFirestoreRemoteStore, deleteRemoteSessionById };
+module.exports = { createFirestoreRemoteStore, deleteRemoteSessionById, SessionZipNotReadyError };
