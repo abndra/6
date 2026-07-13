@@ -398,6 +398,26 @@ async function markGroqKeyDisabled(key, error) {
   }
 }
 
+// سجّل المفتاح الفعّال حالياً (آخر مفتاح Groq نجح فعلياً في توليد رد)
+let _lastActiveKeyWrite = { key: "", at: 0 };
+async function markGroqKeyActive(key) {
+  const target = String(key || "").trim();
+  if (!target) return;
+  // لا نكتب كل مرة — مرة كل 30 ثانية إن لم يتغير المفتاح
+  const t = Date.now();
+  if (_lastActiveKeyWrite.key === target && t - _lastActiveKeyWrite.at < 30_000) return;
+  _lastActiveKeyWrite = { key: target, at: t };
+  try {
+    await botSecretsRef().set(
+      { activeGroqKey: target, activeGroqKeyAt: now(), updatedAt: now() },
+      { merge: true },
+    );
+    botSecretsCache = { data: null, expiresAt: 0, lastErrorLogAt: 0 };
+  } catch (e) {
+    console.error("markGroqKeyActive failed:", e.message);
+  }
+}
+
 module.exports = {
   admin,
   db,
@@ -424,4 +444,5 @@ module.exports = {
   readBotSecrets,
   readStoreConfig,
   markGroqKeyDisabled,
+  markGroqKeyActive,
 };
