@@ -457,24 +457,24 @@ async function markPoolGroqActive(id) {
 
 // تفعيل يومي تلقائي: كل مفتاح disabled_daily_quota يعود active بعد
 // انقضاء 24 ساعة من disabledAt والوصول إلى ساعة/دقيقة التجديد.
+// تفعيل تلقائي: أي مفتاح disabled_daily_quota يعود active بعد مرور 24 ساعة
+// كاملة (بالضبط) من لحظة تعطيله — بدون أي تدخل يدوي.
 async function runPoolGroqAutoRenewal() {
   try {
     const list = await listPoolGroqKeys();
     const now = Date.now();
+    const DAY_MS = 24 * 60 * 60 * 1000;
     for (const k of list) {
       if (k.status !== "disabled_daily_quota") continue;
       const disabledAt = Number(k.disabledAt || 0);
       if (!disabledAt) continue;
-      const next = new Date(disabledAt);
-      next.setDate(next.getDate() + 1);
-      next.setHours(Number(k.renewalHour) || 0, Number(k.renewalMinute) || 0, 0, 0);
-      if (next.getTime() <= now) {
+      if (now - disabledAt >= DAY_MS) {
         await poolGroqRef().doc(k.id).set({
           status: "active",
           disabledAt: null,
           disabledReason: "",
         }, { merge: true });
-        console.log(`🔄 pool_groq/${k.id} أُعيد تفعيله تلقائياً (تجديد يومي).`);
+        console.log(`🔄 pool_groq/${k.id} أُعيد تفعيله تلقائياً بعد 24 ساعة.`);
       }
     }
   } catch (e) {
