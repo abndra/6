@@ -771,15 +771,24 @@ async function isFirstMessage(phone) {
 }
 
 // ============================================================
-// إرسال صورة المنتج — فقط عند طلب صريح من العميل، ومرة واحدة لكل منتج
+// إرسال صور المنتجات — يرسل صورة كل منتج مذكور (بدون تكرار)
 // ============================================================
+// حل جذري لمشكلتين:
+//  1) كان يختار أول منتج فقط ويرسل صورته — الآن يرسل صور كل المنتجات المذكورة.
+//  2) كان يرسل نفس الصورة مرتين — الآن يوجد منع تكرار مزدوج:
+//     (أ) كاش في الذاكرة، (ب) معرّف outbox ثابت عبر .create() يمنع التكرار
+//     حتى لو أعيد تشغيل الخادم أو تعددت النسخ على Railway.
 const _sentImageCache = new Map(); // key: `${phone}|${productName}` → timestamp
 const SENT_IMAGE_TTL_MS = 60 * 60 * 1000; // ساعة كاملة
+const MAX_PRODUCT_IMAGES = 4; // أقصى عدد صور تُرسل في الرد الواحد
+
+function imageTimeBucket() {
+  return Math.floor(Date.now() / SENT_IMAGE_TTL_MS);
+}
 
 function markImageSent(phone, productName) {
   const key = `${phone}|${normalize(productName)}`;
   _sentImageCache.set(key, Date.now());
-  // تنظيف بسيط
   if (_sentImageCache.size > 500) {
     const now = Date.now();
     for (const [k, t] of _sentImageCache) if (now - t > SENT_IMAGE_TTL_MS) _sentImageCache.delete(k);
@@ -794,49 +803,80 @@ function wasImageSentRecently(phone, productName) {
   return true;
 }
 
-// يُستدعى بعد أن يرد البوت. الآن نرسل صورة المنتج تلقائياً عند ذكره —
-// بدون انتظار طلب صريح من العميل — مع منع تكرار نفس الصورة لنفس العميل.
+function safeImageId(value) {
+  return String(value || "").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80);
+}
+
+// يُستدعى بعد أن يرد البوت. يرسل صورة كل منتج مذكور في المحادثة —
+// تلقائياً بدون طلب صريح — مع منع صارم لتكرار نفس الصورة لنفس العميل.
 async function maybeSendProductImage(phone, chatId, userText, replyText) {
-  const products = asArray(botConfig.products).filter((p) => p && (p.imageUrl || p.image));
+  const products = asArray(botConfig.products).filter((p) => p && (p.imageUrl || p.image) && normalize(p.name).length >= 2);
   if (!products.length) return;
 
-  // ابحث عن المنتج المذكور في نص العميل أولاً، ثم في رد البوت.
-  // نرسل الصورة تلقائياً لأي منتج تم ذكره في المحادثة (بدون طلب صريح).
-  let match = null;
-  const searchIn = [userText, replyText];
+  const haystack = `${normalize(userText)} ||| ${normalize(replyText)}`;
+
+  // اجمع كل المنتجات المذكورة (وليس أول منتج فقط) مع إزالة التكرار بالاسم.
+  const seenNames = new Set();
+  const matched = [];
   for (const p of products) {
     const nm = normalize(p.name);
-    if (!nm || nm.length < 2) continue;
-    for (const src of searchIn) {
-      const ns = normalize(src);
-      if (ns && ns.includes(nm) && (!match || nm.length > normalize(match.name).length)) {
-        match = p;
-        break;
-      }
+    if (seenNames.has(nm)) continue;
+    if (haystack.includes(nm)) {
+      seenNames.add(nm);
+      matched.push(p);
     }
   }
-  if (!match) return;
+  if (!matched.length) return;
 
-  const url = match.imageUrl || match.image;
-  if (!url) return;
+  // فضّل الأسماء الأكثر تحديداً أولاً، وحُدّ العدد لتفادي إغراق العميل.
+  matched.sort((a, b) => normalize(b.name).length - normalize(a.name).length);
+  const toSend = matched.slice(0, MAX_PRODUCT_IMAGES);
+  const remaining = matched.length - toSend.length;
 
-  // منع إرسال نفس الصورة أكثر من مرة لنفس العميل خلال ساعة
-  if (wasImageSentRecently(phone, match.name)) return;
-  markImageSent(phone, match.name);
+  let sentCount = 0;
+  for (const match of toSend) {
+    const url = match.imageUrl || match.image;
+    if (!url) continue;
 
-  try {
-    const { botRef: bR, FieldValue: FV } = require("./firestore-writer");
-    await bR().collection("outbox").add({
-      phone, chatId,
-      text: "",
-      mediaUrl: url,
-      type: "image",
-      caption: `${match.name}${match.price ? ` — ${match.price}` : ""}`,
-      status: "pending",
-      createdAt: FV.serverTimestamp(),
-      source: "product-image",
-    });
-  } catch (e) { console.error("queue image:", e.message); }
+    // (أ) منع سريع عبر كاش الذاكرة
+    if (wasImageSentRecently(phone, match.name)) continue;
+
+    try {
+      const { botRef: bR, FieldValue: FV } = require("./firestore-writer");
+      // (ب) منع تكرار عبر معرّف ثابت — .create() يفشل لو أُرسلت الصورة سابقاً
+      const dedupeId = `img_${safeImageId(phone)}_${safeImageId(normalize(match.name))}_${imageTimeBucket()}`;
+      await bR().collection("outbox").doc(dedupeId).create({
+        phone, chatId,
+        text: "",
+        mediaUrl: url,
+        type: "image",
+        caption: `${match.name}${match.price ? ` — ${match.price}` : ""}`,
+        status: "pending",
+        createdAt: FV.serverTimestamp(),
+        source: "product-image",
+      });
+      markImageSent(phone, match.name);
+      sentCount++;
+    } catch (e) {
+      // ALREADY_EXISTS يعني الصورة أُرسلت مسبقاً لنفس العميل — تجاهل بهدوء.
+      if (e?.code === 6 || /ALREADY_EXISTS/i.test(String(e?.message || ""))) {
+        markImageSent(phone, match.name);
+        continue;
+      }
+      console.error("queue image:", e.message);
+    }
+  }
+
+  // لو بقيت منتجات أكثر من الحد، اسأل العميل أي منتج يريد رؤية صورته.
+  if (sentCount > 0 && remaining > 0) {
+    try {
+      await queueAiReply(
+        phone,
+        "هذي صور بعض المنتجات 👆 — أي منتج تحب أرسل لك صورته بالضبط؟",
+        { source: "product-image-prompt", chatId },
+      );
+    } catch (e) { console.error("image prompt:", e.message); }
+  }
 }
 
 
