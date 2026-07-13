@@ -369,6 +369,35 @@ async function readStoreConfig(options = {}) {
   return options.force ? readFreshDoc(storeRef(), storeConfigCache, "store config") : readCachedDoc(storeRef(), storeConfigCache, "store config");
 }
 
+// عطّل مفتاح Groq معيّن داخل botSecrets.groqKeys عند فشله (429/401/403)
+async function markGroqKeyDisabled(key, error) {
+  const target = String(key || "").trim();
+  if (!target) return;
+  try {
+    const ref = botSecretsRef();
+    const snap = await ref.get();
+    const data = snap.exists ? snap.data() : {};
+    const list = Array.isArray(data.groqKeys) ? [...data.groqKeys] : [];
+    let idx = list.findIndex((item) => {
+      if (!item) return false;
+      if (typeof item === "string") return item.trim() === target;
+      return String(item.key || "").trim() === target;
+    });
+    const stamp = { key: target, disabled: true, error: String(error || "").slice(0, 400), disabledAt: Date.now() };
+    if (idx === -1) list.push(stamp);
+    else list[idx] = { ...(typeof list[idx] === "string" ? { key: target } : list[idx]), ...stamp };
+    // إذا كان المفتاح المعطّل هو المفتاح المفرد القديم، نمسحه لتفادي إعادة استخدامه
+    const legacy = String(data.groqApiKey || "").trim();
+    const patch = { groqKeys: list, updatedAt: now() };
+    if (legacy && legacy === target) patch.groqApiKey = "";
+    await ref.set(patch, { merge: true });
+    // امسح الكاش حتى تُقرأ الحالة الجديدة فوراً
+    botSecretsCache = { data: null, expiresAt: 0, lastErrorLogAt: 0 };
+  } catch (e) {
+    console.error("markGroqKeyDisabled failed:", e.message);
+  }
+}
+
 module.exports = {
   admin,
   db,
@@ -394,4 +423,5 @@ module.exports = {
   setConnectionState,
   readBotSecrets,
   readStoreConfig,
+  markGroqKeyDisabled,
 };
