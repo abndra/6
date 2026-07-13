@@ -38,10 +38,24 @@ const STALE_PROCESSING_MS = Number(process.env.AI_STALE_PROCESSING_MS || 120000)
 const AI_POLL_INTERVAL_MS = Math.max(150, Number(process.env.AI_POLL_INTERVAL_MS || 250));
 const AI_RECOVER_INTERVAL_MS = Math.max(15000, Number(process.env.AI_RECOVER_INTERVAL_MS || 30000));
 const AI_GROQ_TIMEOUT_MS = Math.max(4000, Number(process.env.AI_GROQ_TIMEOUT_MS || 15000));
-const AI_MAX_CONCURRENT = Math.max(1, Math.min(20, Number(process.env.AI_MAX_CONCURRENT || 10)));
-const AI_CONFIG_REFRESH_MS = Math.max(1000, Number(process.env.AI_CONFIG_REFRESH_MS || 5000));
+const AI_MAX_CONCURRENT = Math.max(1, Math.min(5, Number(process.env.AI_MAX_CONCURRENT || 2)));
+const AI_CONFIG_REFRESH_MS = Math.max(5000, Number(process.env.AI_CONFIG_REFRESH_MS || 30000));
 const AI_HEARTBEAT_WRITE_MS = Math.max(5000, Number(process.env.AI_HEARTBEAT_WRITE_MS || 30000));
 const DEFAULT_CLOSED_MESSAGE = "نعتذر، المتجر مغلق حالياً. سنعود إليك عند الفتح.";
+const GROQ_FAST_MODEL = process.env.GROQ_FAST_MODEL || "llama-3.1-8b-instant";
+const GROQ_DAILY_LIMIT_COOLDOWN_MS = Math.max(60000, Number(process.env.GROQ_DAILY_LIMIT_COOLDOWN_MS || 10 * 60 * 1000));
+const GROQ_MIN_RETRY_AFTER_MS = Math.max(5000, Number(process.env.GROQ_MIN_RETRY_AFTER_MS || 30000));
+const AI_FALLBACK_COOLDOWN_MS = Math.max(5000, Number(process.env.AI_FALLBACK_COOLDOWN_MS || 30000));
+const AI_HISTORY_LIMIT = Math.max(0, Math.min(4, Number(process.env.AI_HISTORY_LIMIT || 2)));
+const AI_PROMPT_KNOWLEDGE_LIMIT = Math.max(0, Math.min(8, Number(process.env.AI_PROMPT_KNOWLEDGE_LIMIT || 3)));
+const AI_PROMPT_PRODUCT_LIMIT = Math.max(0, Math.min(30, Number(process.env.AI_PROMPT_PRODUCT_LIMIT || 12)));
+const AI_PROMPT_TEXT_LIMIT = Math.max(80, Number(process.env.AI_PROMPT_TEXT_LIMIT || 600));
+const AI_RESPONSE_CACHE_MS = Math.max(0, Number(process.env.AI_RESPONSE_CACHE_MS || 5 * 60 * 1000));
+const AI_MAX_MESSAGE_CHARS = Math.max(200, Number(process.env.AI_MAX_MESSAGE_CHARS || 1200));
+
+const groqCircuit = new Map();
+const responseCache = new Map();
+const customerFallbackCooldown = new Map();
 
 // ============================================================
 // 🛡️  البرومبت الأساسي الافتراضي لجميع بوتات تيسير (لا يُكشف أبداً)
@@ -255,6 +269,118 @@ function tokenScore(a, b) {
   return bw.filter((w) => aw.has(w) || [...aw].some((x) => x.includes(w) || w.includes(x))).length / bw.length;
 }
 
+function clampText(value, limit = AI_PROMPT_TEXT_LIMIT) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!text || text.length <= limit) return text;
+  return text.slice(0, Math.max(0, limit - 1)).trim() + "…";
+}
+
+function cacheKeyFor(text) {
+  return normalize(text).slice(0, 180);
+}
+
+function getCachedReply(text) {
+  if (!AI_RESPONSE_CACHE_MS) return null;
+  const key = cacheKeyFor(text);
+  const hit = responseCache.get(key);
+  if (!hit || hit.expiresAt <= Date.now()) {
+    if (hit) responseCache.delete(key);
+    return null;
+  }
+  return hit.reply;
+}
+
+function setCachedReply(text, reply) {
+  if (!AI_RESPONSE_CACHE_MS || !reply) return;
+  responseCache.set(cacheKeyFor(text), { reply, expiresAt: Date.now() + AI_RESPONSE_CACHE_MS });
+  if (responseCache.size > 200) {
+    const now = Date.now();
+    for (const [key, value] of responseCache) {
+      if (value.expiresAt <= now || responseCache.size > 160) responseCache.delete(key);
+    }
+  }
+}
+
+function getGroqCooldown(key) {
+  const state = groqCircuit.get(key);
+  if (!state || state.until <= Date.now()) {
+    if (state) groqCircuit.delete(key);
+    return null;
+  }
+  return state;
+}
+
+function setGroqCooldown(key, until, reason = "rate_limit") {
+  groqCircuit.set(key, { until, reason });
+}
+
+function parseRetryAfterMs(res, bodyText = "") {
+  const header = Number(res?.headers?.get?.("retry-after"));
+  if (Number.isFinite(header) && header > 0) return header * 1000;
+  const match = String(bodyText || "").match(/try again in\s+(?:(\d+)m)?\s*(\d+(?:\.\d+)?)s/i);
+  if (match) return ((Number(match[1] || 0) * 60) + Number(match[2] || 0)) * 1000;
+  return 0;
+}
+
+function isDailyTokenLimit(bodyText = "") {
+  const text = String(bodyText || "");
+  return /tokens per day|TPD|rate_limit_exceeded/i.test(text);
+}
+
+function fallbackReplyFor(userMessage) {
+  const text = normalize(userMessage);
+  const products = asArray(botConfig.products);
+  const productLines = products.slice(0, 8).map((p) => {
+    const name = textValue(p.name, p.title);
+    const price = p.price != null && p.price !== "" ? ` — ${p.price}` : "";
+    return name ? `• ${name}${price}` : "";
+  }).filter(Boolean);
+
+  if (/(شو|ايش|وش|ماذا|ما)\s*(عندكم|متوفر|متوفرين)|منتجات|المنيو|منيو|اسعار|أسعار|قائمة/i.test(text)) {
+    return productLines.length
+      ? `المتوفر حالياً:\n${productLines.join("\n")}`
+      : "لم يتم إضافة منتجات في المخزون حالياً، تواصل معنا بعد قليل.";
+  }
+
+  const matchedProduct = products.find((p) => {
+    const name = normalize(textValue(p.name, p.title));
+    return name && (text.includes(name) || tokenScore(text, name) >= 0.75);
+  });
+  if (matchedProduct) {
+    const name = textValue(matchedProduct.name, matchedProduct.title, "المنتج");
+    const price = matchedProduct.price != null && matchedProduct.price !== "" ? ` سعره ${matchedProduct.price}.` : "";
+    return `${name} متوفر عندنا.${price} إذا تحب تطلبه ارسل الكمية ووقت الاستلام/التوصيل.`;
+  }
+
+  if (/(طلب|اطلب|ابغى|ابي|اريد|أريد|اخذ|آخذ|اشتري|شراء)/i.test(text)) {
+    return "أكيد، ارسل لي المنتج والكمية والاسم ورقم التواصل ووقت الاستلام/التوصيل عشان نسجل الطلب.";
+  }
+
+  if (/(شكوى|بلاغ|اشتكي|بشتكي|مشكلة|موظف)/i.test(text)) {
+    return "تم استلام البلاغ. ارسل ملخص المشكلة واسم الموظف إن وجد وما الحل المطلوب، وسنرفعها للمتابعة.";
+  }
+
+  if (/(تقييم|نجوم|نجم|⭐)/i.test(text)) {
+    return "يسعدنا تقييمك، كم نجمة من 5؟ واكتب تعليقك لو تحب.";
+  }
+
+  return botConfig.fallbackMessage || "تم استلام رسالتك، وسنرد عليك قريباً.";
+}
+
+function shouldSendFallbackNow(phone) {
+  const key = String(phone || "unknown");
+  const now = Date.now();
+  const last = customerFallbackCooldown.get(key) || 0;
+  if (now - last < AI_FALLBACK_COOLDOWN_MS) return false;
+  customerFallbackCooldown.set(key, now);
+  if (customerFallbackCooldown.size > 500) {
+    for (const [k, t] of customerFallbackCooldown) {
+      if (now - t > AI_FALLBACK_COOLDOWN_MS * 4 || customerFallbackCooldown.size > 400) customerFallbackCooldown.delete(k);
+    }
+  }
+  return true;
+}
+
 function shouldHandOffToHuman(text) {
   if (!botConfig.humanHandoff || !botConfig.humanHandoffTrigger) return false;
   return normalize(text).includes(normalize(botConfig.humanHandoffTrigger));
@@ -429,23 +555,26 @@ function buildSystemPrompt() {
   }
 
   // 🛒 المخزون هو المصدر الوحيد لأسئلة "شو عندكم / منتجاتكم / الأسعار"
-  if (botConfig.products.length) {
+  const promptProducts = botConfig.products.slice(0, AI_PROMPT_PRODUCT_LIMIT);
+  if (promptProducts.length) {
     parts.push(
       "\n=== 🛒 المنتجات المتوفرة (المخزون — المصدر الوحيد للأسعار والمنتجات) ===\n" +
-      botConfig.products.map((p) => {
+      promptProducts.map((p) => {
         const price = p.price != null && p.price !== "" ? ` — السعر: ${p.price}` : "";
         const cat = p.category ? ` [${p.category}]` : "";
-        const desc = p.description ? ` — ${p.description}` : "";
-        return `• ${p.name}${cat}${price}${desc}`;
+        const desc = p.description ? ` — ${clampText(p.description, 180)}` : "";
+        return `• ${clampText(p.name, 120)}${cat}${price}${desc}`;
       }).join("\n") +
+      (botConfig.products.length > promptProducts.length ? `\n… ويوجد ${botConfig.products.length - promptProducts.length} منتج آخر غير معروض لتقليل الاستهلاك؛ إذا لم تجد المنتج في القائمة قل إنك ستتحقق منه.` : "") +
       "\n\n⛔ صارم: عند سؤال العميل عن المنتجات/الأسعار/ما هو المتوفر، اعتمد فقط على القائمة أعلاه. لا تخترع منتجاً غير موجود فيها، ولا تنقل منتجات من قاعدة المعرفة إلى الرد كأنها متوفرة. إذا سأل عن منتج غير موجود قل بوضوح: «هذا المنتج غير متوفر عندنا حالياً»."
     );
   } else {
     parts.push("\n=== 🛒 المنتجات ===\nلا توجد منتجات مسجلة بعد في المخزون. إذا سأل العميل عن المنتجات قل: «لم يتم إضافة منتجات بعد، تواصل معنا لاحقاً».");
   }
 
-  if (botConfig.knowledge.length) {
-    parts.push("\n=== 📚 قاعدة المعرفة (سياسات/معلومات عامة عن المتجر فقط — ليست مصدراً للمنتجات) ===\n" + botConfig.knowledge.map((k) => `• ${k.title}: ${k.content}`).join("\n"));
+  const promptKnowledge = botConfig.knowledge.slice(0, AI_PROMPT_KNOWLEDGE_LIMIT);
+  if (promptKnowledge.length) {
+    parts.push("\n=== 📚 قاعدة المعرفة (سياسات/معلومات عامة عن المتجر فقط — ليست مصدراً للمنتجات) ===\n" + promptKnowledge.map((k) => `• ${clampText(k.title, 100)}: ${clampText(k.content, AI_PROMPT_TEXT_LIMIT)}`).join("\n"));
   }
   if (botConfig.faqs.length) {
     parts.push("\n=== أسئلة شائعة ===\n" + botConfig.faqs.map((f) => `س: ${f.q}\nج: ${f.a}`).join("\n"));
@@ -514,44 +643,77 @@ async function askGroq(userMessage, history = []) {
   const key = String(botConfig.groqApiKey || "").trim();
   if (!key) throw new Error("GROQ_API_KEY missing (أضف مفتاح Groq في إعدادات البوت)");
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), AI_GROQ_TIMEOUT_MS);
-  try {
-    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      signal: controller.signal,
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-      body: JSON.stringify({
-        model: GROQ_MODEL,
-        messages: [
-          { role: "system", content: buildSystemPrompt() },
-          ...history.slice(-6),
-          { role: "user", content: userMessage },
-          // Runtime nudge right before generation — strong dialect enforcement
-          ...(botConfig.dialect && botConfig.dialect !== "auto"
-            ? [{ role: "system", content: `⚠️ تذكير: ردّك التالي بلهجة (${botConfig.dialect}) حصراً وليس بالفصحى.` }]
-            : []),
-        ],
-        temperature: Math.min(0.6, botConfig.temperature ?? 0.5),
-        max_tokens: botConfig.maxTokens,
-      }),
-    });
-    if (!res.ok) throw new Error(`Groq ${res.status}: ${await res.text()}`);
-    const j = await res.json();
-    return j.choices?.[0]?.message?.content?.trim() || "";
-  } catch (error) {
-    if (error?.name === "AbortError") throw new Error(`Groq timeout after ${Math.round(AI_GROQ_TIMEOUT_MS / 1000)}s`);
-    throw error;
-  } finally {
-    clearTimeout(timer);
+  const cached = getCachedReply(userMessage);
+  if (cached) return cached;
+
+  const primaryCooldown = getGroqCooldown(GROQ_MODEL);
+  const models = primaryCooldown ? [GROQ_FAST_MODEL] : [GROQ_MODEL, GROQ_FAST_MODEL].filter((m, i, arr) => m && arr.indexOf(m) === i);
+  let lastError = null;
+
+  for (const model of models) {
+    const cooldown = getGroqCooldown(model);
+    if (cooldown) {
+      lastError = new Error(`Groq ${model} cooling down: ${cooldown.reason}`);
+      lastError.isRateLimited = true;
+      continue;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), AI_GROQ_TIMEOUT_MS);
+    try {
+      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        signal: controller.signal,
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: buildSystemPrompt() },
+            ...history.slice(-AI_HISTORY_LIMIT),
+            { role: "user", content: clampText(userMessage, AI_MAX_MESSAGE_CHARS) },
+            // Runtime nudge right before generation — strong dialect enforcement
+            ...(botConfig.dialect && botConfig.dialect !== "auto"
+              ? [{ role: "system", content: `⚠️ تذكير: ردّك التالي بلهجة (${botConfig.dialect}) حصراً وليس بالفصحى.` }]
+              : []),
+          ],
+          temperature: Math.min(0.5, botConfig.temperature ?? 0.4),
+          max_tokens: Math.max(80, Math.min(350, botConfig.maxTokens || 220)),
+        }),
+      });
+      const bodyText = res.ok ? "" : await res.text();
+      if (!res.ok) {
+        const err = new Error(`Groq ${res.status}: ${bodyText}`);
+        err.status = res.status;
+        err.isRateLimited = res.status === 429;
+        if (res.status === 429) {
+          const retryAfterMs = Math.max(parseRetryAfterMs(res, bodyText), GROQ_MIN_RETRY_AFTER_MS);
+          const cooldownMs = isDailyTokenLimit(bodyText) ? Math.max(retryAfterMs, GROQ_DAILY_LIMIT_COOLDOWN_MS) : retryAfterMs;
+          setGroqCooldown(model, Date.now() + cooldownMs, isDailyTokenLimit(bodyText) ? "daily_token_limit" : "rate_limit");
+        }
+        throw err;
+      }
+      const j = await res.json();
+      const reply = j.choices?.[0]?.message?.content?.trim() || "";
+      setCachedReply(userMessage, reply);
+      return reply;
+    } catch (error) {
+      if (error?.name === "AbortError") lastError = new Error(`Groq timeout after ${Math.round(AI_GROQ_TIMEOUT_MS / 1000)}s`);
+      else lastError = error;
+      if (!lastError.isRateLimited && !/Groq 429/i.test(String(lastError.message || ""))) throw lastError;
+    } finally {
+      clearTimeout(timer);
+    }
   }
+
+  throw lastError || new Error("Groq rate limited");
 }
 
 async function loadHistory(phone) {
+  if (AI_HISTORY_LIMIT <= 0) return [];
   try {
     const snap = await botRef()
       .collection("conversations").doc(phone)
-      .collection("messages").orderBy("timestamp", "desc").limit(4).get();
+        .collection("messages").orderBy("timestamp", "desc").limit(AI_HISTORY_LIMIT).get();
     return snap.docs
       .reverse()
       .map((d) => {
@@ -638,6 +800,7 @@ function makeDedupKey(...parts) {
 async function extractAndLogActivity(phone, userText, botText, history = []) {
   const key = String(botConfig.groqApiKey || "").trim();
   if (!key) return;
+  if (getGroqCooldown(GROQ_FAST_MODEL) || getGroqCooldown(GROQ_MODEL)) return;
 
   // فحص سريع: إذا لم يوجد أي مؤشر (تأكيد طلب/تقييم/بلاغ/اقتراح) في الرد أو الرسالة، لا نُتعب Groq
   const combined = `${userText}\n${botText}`;
@@ -670,14 +833,21 @@ async function extractAndLogActivity(phone, userText, botText, history = []) {
       method: "POST", signal: controller.signal,
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
       body: JSON.stringify({
-        model: GROQ_MODEL,
+        model: GROQ_FAST_MODEL || GROQ_MODEL,
         response_format: { type: "json_object" },
-        messages: [{ role: "system", content: sys }, { role: "user", content: convo }],
-        temperature: 0, max_tokens: 500,
+        messages: [{ role: "system", content: sys }, { role: "user", content: clampText(convo, 1800) }],
+        temperature: 0, max_tokens: 220,
       }),
     });
     clearTimeout(timer);
-    if (!res.ok) return;
+    if (!res.ok) {
+      const bodyText = await res.text().catch(() => "");
+      if (res.status === 429) {
+        const retryAfterMs = Math.max(parseRetryAfterMs(res, bodyText), GROQ_MIN_RETRY_AFTER_MS);
+        setGroqCooldown(GROQ_FAST_MODEL || GROQ_MODEL, Date.now() + retryAfterMs, "activity_rate_limit");
+      }
+      return;
+    }
     const j = await res.json();
     const raw = j.choices?.[0]?.message?.content || "{}";
     let parsed; try { parsed = JSON.parse(raw); } catch { return; }
@@ -836,8 +1006,13 @@ async function processJob(phone, body, msgId, chatId = null) {
       await markIncomingAiError(phone, msgId, e.message);
       return;
     }
-    await queueAiReply(phone, botConfig.fallbackMessage, { source: "fallback", chatId });
-    await markIncomingAiError(phone, msgId, e.message);
+    const fallback = fallbackReplyFor(text);
+    if (shouldSendFallbackNow(phone)) {
+      await queueAiReply(phone, fallback, { source: /429|rate/i.test(String(e.message || "")) ? "rate-limit-fallback" : "fallback", chatId });
+      await markIncomingAiDone(phone, msgId, { aiResponse: fallback, aiSource: "fallback", aiError: String(e.message || "").slice(0, 300) });
+    } else {
+      await markIncomingAiDone(phone, msgId, { aiResponse: null, aiSource: "fallback_suppressed", aiError: String(e.message || "").slice(0, 300) });
+    }
   }
 }
 
