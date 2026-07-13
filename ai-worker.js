@@ -29,6 +29,10 @@ const {
   markIncomingAiDone,
   markIncomingAiError,
   logEvent,
+  listPoolGroqKeys,
+  markPoolGroqDisabled,
+  markPoolGroqActive,
+  runPoolGroqAutoRenewal,
 } = require("./firestore-writer");
 
 // نموذج أذكى بكثير من 8b — يفهم السياق واللهجات بدقة عالية جداً
@@ -130,32 +134,64 @@ function textValue(...values) {
   return "";
 }
 
-// يبني قائمة موحّدة من مفاتيح Groq — يدعم صيغة جديدة (secrets.groqKeys[]) والصيغة القديمة (groqApiKey واحد).
-// كل عنصر: { key, disabled, error }
-function buildGroqKeysList(secrets = {}, bot = {}) {
+// يبني قائمة موحّدة من مفاتيح Groq — يدعم:
+//   1. المفاتيح اليدوية داخل botSecrets/bot (groqKeys[] + groqApiKey).
+//   2. المفاتيح المرجعية من المخزن — أي عنصر يحتوي poolId يُستبدل مفتاحه من pool_groq/{id}
+//      وتُقرأ حالته الفعلية (active/disabled_daily_quota/disabled_auth) من المخزن.
+// كل عنصر: { key, disabled, error, poolId? }
+let poolGroqCache = { list: [], expiresAt: 0 };
+async function getPoolGroqMap() {
+  const now = Date.now();
+  if (now < poolGroqCache.expiresAt) return poolGroqCache.list;
+  poolGroqCache.list = await listPoolGroqKeys();
+  poolGroqCache.expiresAt = now + 30_000; // كاش 30 ثانية
+  return poolGroqCache.list;
+}
+
+async function buildGroqKeysList(secrets = {}, bot = {}) {
   const list = [];
   const seen = new Set();
+  const poolMap = await getPoolGroqMap();
+  const poolById = new Map(poolMap.map((p) => [p.id, p]));
+
   const push = (raw, meta = {}) => {
     const key = String(raw || "").trim();
     if (!key || seen.has(key)) return;
     seen.add(key);
-    list.push({ key, disabled: !!meta.disabled, error: meta.error || "" });
+    list.push({
+      key,
+      disabled: !!meta.disabled,
+      error: meta.error || "",
+      poolId: meta.poolId || "",
+    });
   };
   const arr = Array.isArray(secrets.groqKeys) ? secrets.groqKeys : Array.isArray(bot.groqKeys) ? bot.groqKeys : [];
   for (const item of arr) {
     if (!item) continue;
-    if (typeof item === "string") push(item);
-    else push(item.key, { disabled: item.disabled, error: item.error });
+    if (typeof item === "string") { push(item); continue; }
+    if (item.poolId) {
+      const p = poolById.get(item.poolId);
+      if (p && p.key) {
+        push(p.key, {
+          disabled: p.status !== "active",
+          error: p.disabledReason || "",
+          poolId: p.id,
+        });
+        continue;
+      }
+    }
+    push(item.key, { disabled: item.disabled, error: item.error, poolId: item.poolId });
   }
   push(secrets.groqApiKey);
   push(bot.groqApiKey);
   return list;
 }
 
-function mergeConfig(d = {}, secrets = {}, store = {}) {
+async function mergeConfig(d = {}, secrets = {}, store = {}) {
   const storeName = textValue(store.name, store.storeName, store.slug, "المتجر");
   const botName = textValue(d.name, store.botName, "المساعد");
   const defaultPersona = `أنت ${botName}، مساعد ذكي لمتجر ${storeName}. رد بلغة العميل باختصار ووضوح، واعتمد فقط على معلومات المتجر المحفوظة.`;
+  const groqKeys = await buildGroqKeysList(secrets, d);
   botConfig = {
     greeting: textValue(d.greeting, store.greeting),
     closedMessage: textValue(d.closedMessage, d.offHoursMessage, store.closedMessage, store.offHoursMessage),
@@ -175,18 +211,12 @@ function mergeConfig(d = {}, secrets = {}, store = {}) {
     products: [...asArray(store.products), ...asArray(d.products)],
     quickReplies: [...asArray(store.quickReplies), ...asArray(d.quickReplies)],
     faqs: [...asArray(store.faqs), ...asArray(d.faqs)],
-    // مهم: المفاتيح المتعددة هي المصدر الأساسي، والمفتاح المفرد يبقى للتوافق فقط.
-    groqApiKeys: buildGroqKeysList(secrets, d),
-    groqApiKey: textValue(
-      (buildGroqKeysList(secrets, d).find((k) => k && !k.disabled) || {}).key,
-      secrets.groqApiKey,
-      d.groqApiKey,
-    ),
+    groqApiKeys: groqKeys,
+    groqApiKey: textValue((groqKeys.find((k) => k && !k.disabled) || {}).key, secrets.groqApiKey, d.groqApiKey),
     storeName,
     botName,
     language: textValue(d.language, store.language, "ar"),
     temperature: typeof d.temperature === "number" ? Math.max(0, Math.min(1, d.temperature)) : botConfig.temperature,
-    // maxTokens مشتق تقريبياً من charLimit (حرف عربي ≈ توكن واحد)
     maxTokens: typeof d.maxTokens === "number"
       ? Math.max(80, Math.min(1200, d.maxTokens))
       : Math.max(80, Math.min(1200, Math.round((typeof d.charLimit === "number" ? d.charLimit : 500) * 1.2))),
@@ -205,7 +235,7 @@ function mergeConfig(d = {}, secrets = {}, store = {}) {
 
 async function refreshConfig(d, options = {}) {
   const [secrets, store] = await Promise.all([readBotSecrets(options), readStoreConfig(options)]);
-  mergeConfig(d, secrets, store);
+  await mergeConfig(d, secrets, store);
   console.log(
     "✓ إعدادات الذكاء محدّثة | Groq key:",
     (botConfig.groqApiKeys || []).filter((k) => k && !k.disabled).length ? `${(botConfig.groqApiKeys || []).filter((k) => k && !k.disabled).length} متاح` : "غير موجود",
@@ -675,10 +705,10 @@ async function askGroq(userMessage, history = []) {
       try {
         const reply = await callGroqOnce({ key: entry.key, model, userMessage, history });
         setCachedReply(userMessage, reply);
-        // سجّل هذا المفتاح كـ "الفعّال حالياً" حتى تظهر حالته في اللوحة
         try {
           const { markGroqKeyActive } = require("./firestore-writer");
           markGroqKeyActive(entry.key).catch(() => {});
+          if (entry.poolId) markPoolGroqActive(entry.poolId).catch(() => {});
         } catch {}
         return reply;
       } catch (error) {
@@ -693,6 +723,13 @@ async function askGroq(userMessage, history = []) {
           try {
             const { markGroqKeyDisabled } = require("./firestore-writer");
             await markGroqKeyDisabled(entry.key, entry.error);
+            // إذا كان المفتاح من المخزن، عطّله في المخزن أيضاً حتى تعرف بقية البوتات
+            // + يعود تلقائياً بعد يوم في وقت التجديد.
+            if (entry.poolId) {
+              await markPoolGroqDisabled(entry.poolId, entry.error, !!error?.isAuthError);
+              // امسح كاش المخزن حتى يُقرأ الوضع الجديد فوراً
+              poolGroqCache = { list: [], expiresAt: 0 };
+            }
           } catch (e) {
             console.error("markGroqKeyDisabled failed:", e.message);
           }
@@ -1216,6 +1253,16 @@ setInterval(() => {
 setInterval(() => {
   recoverStuckJobs().catch((e) => console.error("recover stuck jobs error:", e.message));
 }, AI_RECOVER_INTERVAL_MS).unref?.();
+
+// تجديد يومي تلقائي لمفاتيح Groq المعطّلة بسبب الحصة اليومية (429).
+// يفحص كل 5 دقائق: أي مفتاح تجاوز 24 ساعة على تعطّله ووصل وقت التجديد → يعود active.
+setInterval(() => {
+  runPoolGroqAutoRenewal()
+    .then(() => { poolGroqCache = { list: [], expiresAt: 0 }; })
+    .catch((e) => console.error("pool renewal error:", e.message));
+}, 5 * 60 * 1000).unref?.();
+// شغّله فوراً عند الإقلاع أيضاً
+runPoolGroqAutoRenewal().catch(() => {});
 
 // عند الإقلاع، عالِج أي رسائل بقيت pending
 (async () => {

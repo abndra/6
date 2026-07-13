@@ -418,6 +418,70 @@ async function markGroqKeyActive(key) {
   }
 }
 
+// ============================================================
+// 9) مخزن مفاتيح Groq المشترك (pool_groq/{id})
+//    - كل مفتاح يُخزَّن مرة واحدة في المخزن.
+//    - أي بوت يشير له عبر { poolId } داخل groqKeys[].
+// ============================================================
+const poolGroqRef = () => db.collection("pool_groq");
+
+async function listPoolGroqKeys() {
+  try {
+    const snap = await poolGroqRef().get();
+    return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  } catch (e) {
+    console.error("listPoolGroqKeys failed:", e.message);
+    return [];
+  }
+}
+
+async function markPoolGroqDisabled(id, reason, isAuthError) {
+  if (!id) return;
+  try {
+    await poolGroqRef().doc(id).set({
+      status: isAuthError ? "disabled_auth" : "disabled_daily_quota",
+      disabledAt: Date.now(),
+      disabledReason: String(reason || "").slice(0, 400),
+    }, { merge: true });
+  } catch (e) {
+    console.error("markPoolGroqDisabled failed:", e.message);
+  }
+}
+
+async function markPoolGroqActive(id) {
+  if (!id) return;
+  try {
+    await poolGroqRef().doc(id).set({ lastActiveAt: Date.now() }, { merge: true });
+  } catch {}
+}
+
+// تفعيل يومي تلقائي: كل مفتاح disabled_daily_quota يعود active بعد
+// انقضاء 24 ساعة من disabledAt والوصول إلى ساعة/دقيقة التجديد.
+async function runPoolGroqAutoRenewal() {
+  try {
+    const list = await listPoolGroqKeys();
+    const now = Date.now();
+    for (const k of list) {
+      if (k.status !== "disabled_daily_quota") continue;
+      const disabledAt = Number(k.disabledAt || 0);
+      if (!disabledAt) continue;
+      const next = new Date(disabledAt);
+      next.setDate(next.getDate() + 1);
+      next.setHours(Number(k.renewalHour) || 0, Number(k.renewalMinute) || 0, 0, 0);
+      if (next.getTime() <= now) {
+        await poolGroqRef().doc(k.id).set({
+          status: "active",
+          disabledAt: null,
+          disabledReason: "",
+        }, { merge: true });
+        console.log(`🔄 pool_groq/${k.id} أُعيد تفعيله تلقائياً (تجديد يومي).`);
+      }
+    }
+  } catch (e) {
+    console.error("runPoolGroqAutoRenewal failed:", e.message);
+  }
+}
+
 module.exports = {
   admin,
   db,
@@ -445,4 +509,8 @@ module.exports = {
   readStoreConfig,
   markGroqKeyDisabled,
   markGroqKeyActive,
+  listPoolGroqKeys,
+  markPoolGroqDisabled,
+  markPoolGroqActive,
+  runPoolGroqAutoRenewal,
 };
