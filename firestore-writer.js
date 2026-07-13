@@ -232,6 +232,17 @@ async function saveIncomingMessage(msg) {
     }),
   ]);
 
+  // سجّل قيداً في سجل استهلاك التوكن — قراءة رسالة عميل
+  appendTokenLedger({
+    type: "msgIn",
+    cost: 0.0375,
+    phone,
+    chatId,
+    name,
+    preview: (body || `[${msg.type}]`).slice(0, 80),
+    direction: "in",
+  }).catch(() => {});
+
   return { phone, name, body, msgId: msgDoc.id };
 }
 
@@ -314,7 +325,43 @@ async function queueOutgoingMessage(phone, text, { source = "api", chatId = null
     }),
   ]);
 
+  // سجّل قيد استهلاك — إرسال رد
+  appendTokenLedger({
+    type: "msgOut",
+    cost: 0.0375,
+    phone,
+    chatId,
+    preview: String(text || "").slice(0, 80),
+    direction: "out",
+    source,
+  }).catch(() => {});
+
   return msgDoc.id;
+}
+
+// ============================================================
+// سجل استهلاك التوكن — يُكتب في مجموعة فرعية للبوت
+// يستخدمه لوحة الأدمين لعرض تفاصيل كل عملية استهلاك
+// ============================================================
+async function appendTokenLedger(entry = {}) {
+  try {
+    const doc = {
+      at: now(),
+      type: String(entry.type || "msgOut"),
+      cost: Number(entry.cost || 0),
+      phone: entry.phone ? String(entry.phone) : null,
+      chatId: entry.chatId ? String(entry.chatId) : null,
+      name: entry.name ? String(entry.name).slice(0, 80) : null,
+      preview: entry.preview ? String(entry.preview).slice(0, 200) : "",
+      direction: entry.direction === "in" ? "in" : "out",
+      source: entry.source ? String(entry.source) : null,
+    };
+    await botRef().collection("tokenLedger").add(doc);
+    // trim: احتفظ بآخر ~500 قيد فقط لتجنّب تضخّم الجدول.
+    // نعتمد على تنظيف دوري خارج هذه الدالة إن لزم.
+  } catch (e) {
+    console.error("appendTokenLedger:", e.message);
+  }
 }
 
 // ============================================================
@@ -513,4 +560,5 @@ module.exports = {
   markPoolGroqDisabled,
   markPoolGroqActive,
   runPoolGroqAutoRenewal,
+  appendTokenLedger,
 };

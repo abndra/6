@@ -969,16 +969,23 @@ async function isFirstMessage(phone) {
 //  2) كان يرسل نفس الصورة مرتين — الآن يوجد منع تكرار مزدوج:
 //     (أ) كاش في الذاكرة، (ب) معرّف outbox ثابت عبر .create() يمنع التكرار
 //     حتى لو أعيد تشغيل الخادم أو تعددت النسخ على Railway.
-const _sentImageCache = new Map(); // key: `${phone}|${productName}` → timestamp
-const SENT_IMAGE_TTL_MS = 60 * 60 * 1000; // ساعة كاملة
-const MAX_PRODUCT_IMAGES = 4; // أقصى عدد صور تُرسل في الرد الواحد
+const _sentImageCache = new Map(); // key: `${phone}|${productKey}` → timestamp
+const _imageSendLocks = new Map(); // key: phone → Promise (serialize instant+final calls)
+const SENT_IMAGE_TTL_MS = 10 * 60 * 1000; // 10 دقائق — لا تُعاد نفس الصورة خلال هذه المدة
+const MAX_PRODUCT_IMAGES = 3; // حد أقصى صارم: 3 صور فقط في أي رد
 
 function imageTimeBucket() {
   return Math.floor(Date.now() / SENT_IMAGE_TTL_MS);
 }
 
-function markImageSent(phone, productName) {
-  const key = `${phone}|${normalize(productName)}`;
+function productKey(product) {
+  const id = product?.id ?? product?.productId ?? product?.sku;
+  if (id) return `id:${String(id)}`;
+  return `n:${normalize(textValue(product?.name, product?.title))}`;
+}
+
+function markImageSent(phone, product) {
+  const key = `${phone}|${productKey(product)}`;
   _sentImageCache.set(key, Date.now());
   if (_sentImageCache.size > 500) {
     const now = Date.now();
@@ -986,8 +993,8 @@ function markImageSent(phone, productName) {
   }
 }
 
-function wasImageSentRecently(phone, productName) {
-  const key = `${phone}|${normalize(productName)}`;
+function wasImageSentRecently(phone, product) {
+  const key = `${phone}|${productKey(product)}`;
   const t = _sentImageCache.get(key);
   if (!t) return false;
   if (Date.now() - t > SENT_IMAGE_TTL_MS) { _sentImageCache.delete(key); return false; }
@@ -1009,6 +1016,19 @@ function imageDedupeBucket(explicit) {
 // يُستدعى بعد أن يرد البوت. يرسل صورة كل منتج مذكور في المحادثة —
 // وعند طلب الصورة صراحةً يرسلها فوراً حتى لو أُرسلت سابقاً.
 async function maybeSendProductImage(phone, chatId, userText, replyText) {
+  // قفل تسلسلي لكل عميل — منع تسابق نداءي instant/final اللذين يرسلان نفس الصور.
+  const prev = _imageSendLocks.get(phone);
+  const run = (async () => {
+    if (prev) { try { await prev; } catch {} }
+    return _maybeSendProductImageImpl(phone, chatId, userText, replyText);
+  })();
+  _imageSendLocks.set(phone, run);
+  try { await run; } finally {
+    if (_imageSendLocks.get(phone) === run) _imageSendLocks.delete(phone);
+  }
+}
+
+async function _maybeSendProductImageImpl(phone, chatId, userText, replyText) {
   const products = asArray(botConfig.products).filter((p) => p && (p.imageUrl || p.image) && normalize(textValue(p.name, p.title)).length >= 2);
   if (!products.length) return;
 
@@ -1019,7 +1039,14 @@ async function maybeSendProductImage(phone, chatId, userText, replyText) {
 
   // فضّل الأسماء الأكثر تحديداً أولاً، وحُدّ العدد لتفادي إغراق العميل.
   matched.sort((a, b) => normalize(textValue(b.name, b.title)).length - normalize(textValue(a.name, a.title)).length);
-  const toSend = matched.slice(0, MAX_PRODUCT_IMAGES);
+
+  // إن لم يطلب العميل صورة صراحةً واقترحت المطابقة أكثر من 3 منتجات،
+  // اختر 3 عشوائياً من ضمن المطابَقات لإعطاء تنوّع بدل الإغراق.
+  let candidates = matched;
+  if (!explicit && matched.length > MAX_PRODUCT_IMAGES) {
+    candidates = [...matched].sort(() => Math.random() - 0.5);
+  }
+  const toSend = candidates.slice(0, MAX_PRODUCT_IMAGES);
   const remaining = matched.length - toSend.length;
 
   let sentCount = 0;
@@ -1028,12 +1055,13 @@ async function maybeSendProductImage(phone, chatId, userText, replyText) {
     if (!url) continue;
 
     // (أ) منع سريع عبر كاش الذاكرة — إلا إذا طلب العميل الصورة صراحةً.
-    if (!explicit && wasImageSentRecently(phone, match.name)) continue;
+    if (!explicit && wasImageSentRecently(phone, match)) continue;
 
     try {
       const { botRef: bR, FieldValue: FV } = require("./firestore-writer");
       // (ب) منع تكرار عبر معرّف ثابت — .create() يفشل لو أُرسلت الصورة سابقاً
-      const dedupeId = `img_${safeImageId(phone)}_${safeImageId(normalize(match.name))}_${imageDedupeBucket(explicit)}`;
+      const pk = safeImageId(productKey(match).replace(/^(id:|n:)/, ""));
+      const dedupeId = `img_${safeImageId(phone)}_${pk}_${imageDedupeBucket(explicit)}`;
       await bR().collection("outbox").doc(dedupeId).create({
         phone, chatId,
         text: "",
@@ -1044,24 +1072,24 @@ async function maybeSendProductImage(phone, chatId, userText, replyText) {
         createdAt: FV.serverTimestamp(),
         source: "product-image",
       });
-      markImageSent(phone, match.name);
+      markImageSent(phone, match);
       sentCount++;
     } catch (e) {
       // ALREADY_EXISTS يعني الصورة أُرسلت مسبقاً لنفس العميل — تجاهل بهدوء.
       if (e?.code === 6 || /ALREADY_EXISTS/i.test(String(e?.message || ""))) {
-        markImageSent(phone, match.name);
+        markImageSent(phone, match);
         continue;
       }
       console.error("queue image:", e.message);
     }
   }
 
-  // لو بقيت منتجات أكثر من الحد، اسأل العميل أي منتج يريد رؤية صورته.
+  // لو بقيت منتجات أكثر من الحد، أخبر العميل ودعه يسمّي المنتج المطلوب.
   if (sentCount > 0 && remaining > 0) {
     try {
       await queueAiReply(
         phone,
-        "هذي صور بعض المنتجات 👆 — أي منتج تحب أرسل لك صورته بالضبط؟",
+        "لدينا خيارات أكثر — قل لي اسم المنتج الذي تودّ رؤيته وسأرسل صورته 📸",
         { source: "product-image-prompt", chatId },
       );
     } catch (e) { console.error("image prompt:", e.message); }
