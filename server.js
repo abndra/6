@@ -15,7 +15,7 @@
 // dependencies: whatsapp-web.js qrcode-terminal qrcode @supabase/supabase-js express
 // ============================================================
 
-const { Client, RemoteAuth } = require("whatsapp-web.js");
+const { Client, RemoteAuth, MessageMedia } = require("whatsapp-web.js");
 const qrcodeTerminal = require("qrcode-terminal");
 const QRCode = require("qrcode");
 const express = require("express");
@@ -57,6 +57,13 @@ const CONNECTION_VERIFY_INTERVAL_MS = Math.max(30000, Number(process.env.CONNECT
 const OUTBOX_HEARTBEAT_WRITE_MS = Math.max(5000, Number(process.env.OUTBOX_HEARTBEAT_WRITE_MS || 30000));
 
 // ---- عميل واتساب ----
+// اسم يظهر في «الأجهزة المرتبطة» داخل واتساب. المفتاح هو User-Agent الذي يمرره Chromium
+// إلى WhatsApp Web — يستخرج منه واتساب اسم النظام/المتصفح ليعرضه في قائمة الأجهزة.
+// نجعل حقل «النظام» = Taysir حتى يظهر «Taysir» بدلاً من «Mac OS».
+const TAYSIR_USER_AGENT =
+  process.env.TAYSIR_USER_AGENT ||
+  "Mozilla/5.0 (Taysir; WhatsApp Assistant) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
 const client = new Client({
   authStrategy: new RemoteAuth({
     clientId: REMOTE_SESSION_CLIENT_ID,
@@ -64,9 +71,10 @@ const client = new Client({
     store: createFirestoreRemoteStore(),
     backupSyncIntervalMs: REMOTE_SESSION_BACKUP_MS,
   }),
+  // اسم عميل واتساب — يظهر مع أيقونة الجهاز داخل «الأجهزة المرتبطة».
+  userAgent: TAYSIR_USER_AGENT,
   puppeteer: {
     headless: true,
-    // على Railway يُثبَّت Chromium عبر Dockerfile ويُمرَّر مساره هنا.
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     args: [
       "--no-sandbox",
@@ -78,9 +86,18 @@ const client = new Client({
       "--disable-background-timer-throttling",
       "--disable-backgrounding-occluded-windows",
       "--disable-renderer-backgrounding",
+      `--user-agent=${TAYSIR_USER_AGENT}`,
       "--js-flags=--max-old-space-size=128",
     ],
   },
+});
+
+// نضبط User-Agent مباشرة على صفحة Puppeteer فور جاهزيتها كطبقة أمان إضافية.
+client.on("ready", async () => {
+  try {
+    const page = client.pupPage;
+    if (page && typeof page.setUserAgent === "function") await page.setUserAgent(TAYSIR_USER_AGENT);
+  } catch (_) {}
 });
 
 let latestQrRaw = null;
@@ -389,8 +406,9 @@ setInterval(() => {
 }, OUTBOX_POLL_INTERVAL_MS).unref?.();
 
 async function sendOne(doc) {
-  const { phone, chatId, text, convMsgId } = doc.data() || {};
-  if (!phone || !text) {
+  const data = doc.data() || {};
+  const { phone, chatId, text, convMsgId, mediaUrl, type, caption } = data;
+  if (!phone || (!text && !mediaUrl)) {
     await markOutboxError(doc.id, "missing phone/text");
     return;
   }
@@ -399,20 +417,34 @@ async function sendOne(doc) {
     return;
   }
   try {
-    const autoKey = `${phone}:${text}`;
+    const autoKey = `${phone}:${text || mediaUrl}`;
     recentAutoSends.add(autoKey);
     setTimeout(() => recentAutoSends.delete(autoKey), 30000).unref?.();
     const destination = chatId || (/^\d{8,15}$/.test(String(phone)) ? `${phone}@c.us` : null);
     if (!destination) throw new Error("missing chatId for non-phone WhatsApp contact");
-    await client.sendMessage(destination, text);
+
+    if (mediaUrl && (type === "image" || /^data:image|\.(jpe?g|png|webp|gif)(\?|$)/i.test(mediaUrl))) {
+      let media;
+      if (/^data:/i.test(mediaUrl)) {
+        const m = mediaUrl.match(/^data:([^;]+);base64,(.+)$/);
+        if (!m) throw new Error("invalid data URL");
+        media = new MessageMedia(m[1], m[2], "product.jpg");
+      } else {
+        media = await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true });
+      }
+      await client.sendMessage(destination, media, { caption: caption || text || undefined });
+    } else {
+      await client.sendMessage(destination, text);
+    }
     await markOutboxSent(doc.id, phone, convMsgId);
-    console.log(`→ أُرسلت رسالة إلى ${phone}`);
+    console.log(`→ أُرسلت ${mediaUrl ? "صورة" : "رسالة"} إلى ${phone}`);
   } catch (e) {
     console.error("send failed:", e.message);
     await markOutboxError(doc.id, e.message);
     await logEvent("send_error", { phone, message: e.message });
   }
 }
+
 
 // عند عودة الاتصال، أعد فحص أي رسائل بقيت pending
 client.on("ready", async () => {
