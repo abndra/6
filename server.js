@@ -57,12 +57,14 @@ const CONNECTION_VERIFY_INTERVAL_MS = Math.max(30000, Number(process.env.CONNECT
 const OUTBOX_HEARTBEAT_WRITE_MS = Math.max(5000, Number(process.env.OUTBOX_HEARTBEAT_WRITE_MS || 30000));
 
 // ---- عميل واتساب ----
-// اسم يظهر في «الأجهزة المرتبطة» داخل واتساب. المفتاح هو User-Agent الذي يمرره Chromium
-// إلى WhatsApp Web — يستخرج منه واتساب اسم النظام/المتصفح ليعرضه في قائمة الأجهزة.
-// نجعل حقل «النظام» = Taysir حتى يظهر «Taysir» بدلاً من «Mac OS».
+// الاسم الذي يظهر في «الأجهزة المرتبطة» = navigator.platform (النظام) + متصفح مستخرَج من UA.
+// نستخدم UA قياسي كامل حتى يتعرّف واتساب على المتصفح (Chrome) بدلاً من إظهار null،
+// ثم نُبدّل navigator.platform إلى "Taysir" قبل تحميل صفحة WhatsApp Web عبر
+// evaluateOnNewDocument — هذا يجعل الجهاز يظهر باسم «Taysir» بدل «Mac OS».
+const TAYSIR_DEVICE_NAME = process.env.TAYSIR_DEVICE_NAME || "Taysir";
 const TAYSIR_USER_AGENT =
   process.env.TAYSIR_USER_AGENT ||
-  "Mozilla/5.0 (Taysir; WhatsApp Assistant) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 const client = new Client({
   authStrategy: new RemoteAuth({
@@ -71,8 +73,11 @@ const client = new Client({
     store: createFirestoreRemoteStore(),
     backupSyncIntervalMs: REMOTE_SESSION_BACKUP_MS,
   }),
-  // اسم عميل واتساب — يظهر مع أيقونة الجهاز داخل «الأجهزة المرتبطة».
   userAgent: TAYSIR_USER_AGENT,
+  // حل جذري لمشكلة «تسجيل خروج فور مسح QR»: إذا كانت هناك جلسة سابقة/متعارضة على
+  // نفس الرقم، نأخذ الأولوية بدل أن يطردنا واتساب. takeoverTimeoutMs=0 يعني فوراً.
+  takeoverOnConflict: true,
+  takeoverTimeoutMs: 0,
   puppeteer: {
     headless: true,
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
@@ -92,12 +97,43 @@ const client = new Client({
   },
 });
 
-// نضبط User-Agent مباشرة على صفحة Puppeteer فور جاهزيتها كطبقة أمان إضافية.
-client.on("ready", async () => {
+// نُعدّل navigator.platform إلى اسم البراند قبل أن تُحمّل صفحة WhatsApp Web،
+// لأن قائمة «الأجهزة المرتبطة» تعرض هذه القيمة كاسم النظام.
+async function applyTaysirBranding(page) {
+  if (!page) return;
   try {
-    const page = client.pupPage;
-    if (page && typeof page.setUserAgent === "function") await page.setUserAgent(TAYSIR_USER_AGENT);
+    await page.setUserAgent(TAYSIR_USER_AGENT);
   } catch (_) {}
+  try {
+    await page.evaluateOnNewDocument((deviceName) => {
+      try {
+        Object.defineProperty(navigator, "platform", { get: () => deviceName, configurable: true });
+      } catch (_) {}
+      try {
+        Object.defineProperty(navigator, "userAgentData", {
+          get: () => ({
+            brands: [{ brand: "Chromium", version: "124" }, { brand: deviceName, version: "1" }],
+            mobile: false,
+            platform: deviceName,
+          }),
+          configurable: true,
+        });
+      } catch (_) {}
+    }, TAYSIR_DEVICE_NAME);
+  } catch (_) {}
+}
+
+// نلتقط الصفحة فور إنشائها (قبل initialize يفتح WhatsApp Web) عبر hook داخلي.
+const _originalInitialize = client.initialize.bind(client);
+client.initialize = async function () {
+  const result = await _originalInitialize();
+  await applyTaysirBranding(client.pupPage);
+  return result;
+};
+
+// طبقة أمان إضافية عند ready.
+client.on("ready", async () => {
+  await applyTaysirBranding(client.pupPage);
 });
 
 let latestQrRaw = null;
