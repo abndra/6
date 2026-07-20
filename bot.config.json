@@ -1,7 +1,7 @@
 {
-  "botName": "أحمد",
-  "storeId": "ezdpW6w1VR3jqVCNCYQg",
-  "botId": "AfIvCqC5zS3d0OwBoYbb",
+  "botName": "نورة",
+  "storeId": "SAeFS92CbbFnRiVPRUtD",
+  "botId": "GpudDcob1rdfjhAC5mFN",
   "database": "supabase-documents",
   "filesVersion": "4.3.0",
   "filesVersionNote": "Stable sessions: bot.config wins over stale Railway IDs, lower memory defaults, quieter AI refresh logs, hard session reset",
