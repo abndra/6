@@ -39,11 +39,11 @@ const {
 const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 const STALE_PROCESSING_MS = Number(process.env.AI_STALE_PROCESSING_MS || 120000);
 // السرعة أولاً: onSnapshot يلتقط الرسالة فوراً، polling كشبكة أمان بأدنى تأخير
-const AI_POLL_INTERVAL_MS = Math.max(150, Number(process.env.AI_POLL_INTERVAL_MS || 250));
+const AI_POLL_INTERVAL_MS = Math.max(500, Number(process.env.AI_POLL_INTERVAL_MS || 1000));
 const AI_RECOVER_INTERVAL_MS = Math.max(15000, Number(process.env.AI_RECOVER_INTERVAL_MS || 30000));
 const AI_GROQ_TIMEOUT_MS = Math.max(4000, Number(process.env.AI_GROQ_TIMEOUT_MS || 15000));
-const AI_MAX_CONCURRENT = Math.max(1, Math.min(5, Number(process.env.AI_MAX_CONCURRENT || 2)));
-const AI_CONFIG_REFRESH_MS = Math.max(5000, Number(process.env.AI_CONFIG_REFRESH_MS || 30000));
+const AI_MAX_CONCURRENT = Math.max(1, Math.min(3, Number(process.env.AI_MAX_CONCURRENT || 1)));
+const AI_CONFIG_REFRESH_MS = Math.max(30000, Number(process.env.AI_CONFIG_REFRESH_MS || 60000));
 const AI_HEARTBEAT_WRITE_MS = Math.max(5000, Number(process.env.AI_HEARTBEAT_WRITE_MS || 30000));
 const DEFAULT_CLOSED_MESSAGE = "نعتذر، المتجر مغلق حالياً. سنعود إليك عند الفتح.";
 const GROQ_FAST_MODEL = process.env.GROQ_FAST_MODEL || "llama-3.3-70b-versatile";
@@ -121,6 +121,7 @@ let botConfig = {
   storeWebsite: "",
 };
 let lastAiHeartbeatAt = 0;
+let lastConfigLog = { key: "", at: 0 };
 
 function asArray(value) {
   return Array.isArray(value) ? value.filter(Boolean) : [];
@@ -270,18 +271,24 @@ async function mergeConfig(d = {}, secrets = {}, store = {}) {
 async function refreshConfig(d, options = {}) {
   const [secrets, store] = await Promise.all([readBotSecrets(options), readStoreConfig(options)]);
   await mergeConfig(d, secrets, store);
-  console.log(
-    "✓ إعدادات الذكاء محدّثة | Groq key:",
-    (botConfig.groqApiKeys || []).filter((k) => k && !k.disabled).length ? `${(botConfig.groqApiKeys || []).filter((k) => k && !k.disabled).length} متاح` : "غير موجود",
-    "| معرفة:",
-    botConfig.knowledge.length,
-    "| منتجات:",
-    botConfig.products.length,
-    "| ردود:",
-    botConfig.quickReplies.length,
-    "| FAQ:",
-    botConfig.faqs.length,
-  );
+  const availableKeys = (botConfig.groqApiKeys || []).filter((k) => k && !k.disabled).length;
+  const logKey = [botConfig.configFingerprint, availableKeys, botConfig.knowledge.length, botConfig.products.length, botConfig.quickReplies.length, botConfig.faqs.length].join("|");
+  const nowMs = Date.now();
+  if (logKey !== lastConfigLog.key || nowMs - lastConfigLog.at > 5 * 60 * 1000) {
+    lastConfigLog = { key: logKey, at: nowMs };
+    console.log(
+      "✓ إعدادات الذكاء محدّثة | Groq key:",
+      availableKeys ? `${availableKeys} متاح` : "غير موجود",
+      "| معرفة:",
+      botConfig.knowledge.length,
+      "| منتجات:",
+      botConfig.products.length,
+      "| ردود:",
+      botConfig.quickReplies.length,
+      "| FAQ:",
+      botConfig.faqs.length,
+    );
+  }
 }
 
 async function refreshConfigFromSupabase(reason = "interval") {

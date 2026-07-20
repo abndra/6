@@ -9,8 +9,8 @@
 // هو لا يعرف شيئاً عن Groq ولا يبني أي رد. الذكاء يعمل في ai-worker.js.
 //
 // المتغيرات المطلوبة في Railway → Variables:
-//   APP_SUPABASE_URL, APP_SUPABASE_SECRET_KEY, TAYSIR_STORE_ID, TAYSIR_BOT_ID
-//   SERVICE_TOKEN (اختياري) = نفس قيمة railwayApiKey في إعدادات البوت
+//   APP_SUPABASE_URL, APP_SUPABASE_SECRET_KEY
+//   SERVICE_TOKEN = نفس قيمة railwayApiKey في إعدادات البوت
 //
 // dependencies: whatsapp-web.js qrcode-terminal qrcode @supabase/supabase-js express
 // ============================================================
@@ -37,9 +37,12 @@ const {
   isRealCustomer,
   customerIdFromJid,
 } = require("./firestore-writer");
-const { createFirestoreRemoteStore, deleteRemoteSessionById } = require("./firestore-session-store");
+const { createFirestoreRemoteStore, deleteRemoteSessionById, deleteAllRemoteSessions } = require("./firestore-session-store");
 
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "";
+if (!SERVICE_TOKEN) {
+  console.error("SERVICE_TOKEN is required. أضفه في Railway بنفس قيمة railwayApiKey في لوحة تيسير.");
+}
 // نقبل الرسائل القريبة من لحظة الربط حتى لا تُرفض بسبب فرق توقيت واتساب،
 // وفي نفس الوقت لا نستورد المحادثات القديمة جداً.
 const NEW_MESSAGE_GRACE_SEC = Number(process.env.NEW_MESSAGE_GRACE_SEC || 45);
@@ -55,6 +58,7 @@ const MESSAGE_SWEEP_LIMIT = Math.max(3, Math.min(10, Number(process.env.MESSAGE_
 const WA_STATE_TIMEOUT_MS = Math.max(3000, Number(process.env.WA_STATE_TIMEOUT_MS || 7000));
 const CONNECTION_VERIFY_INTERVAL_MS = Math.max(30000, Number(process.env.CONNECTION_VERIFY_INTERVAL_MS || 60000));
 const OUTBOX_HEARTBEAT_WRITE_MS = Math.max(5000, Number(process.env.OUTBOX_HEARTBEAT_WRITE_MS || 30000));
+let shutdownRequested = false;
 
 // ---- عميل واتساب ----
 // الاسم الذي يظهر في «الأجهزة المرتبطة» = navigator.platform (النظام) + متصفح مستخرَج من UA.
@@ -91,8 +95,12 @@ const client = new Client({
       "--disable-background-timer-throttling",
       "--disable-backgrounding-occluded-windows",
       "--disable-renderer-backgrounding",
+      "--disable-background-networking",
+      "--disable-sync",
+      "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints",
+      "--renderer-process-limit=1",
       `--user-agent=${TAYSIR_USER_AGENT}`,
-      "--js-flags=--max-old-space-size=128",
+      "--js-flags=--max-old-space-size=96",
     ],
   },
 });
@@ -246,6 +254,54 @@ process.on("uncaughtException", (error) => {
   console.error("uncaughtException:", lastError);
 });
 
+async function clearLocalAndRemoteSession() {
+  const sessionName = client.authStrategy?.sessionName || `RemoteAuth-${REMOTE_SESSION_CLIENT_ID}`;
+  await Promise.allSettled([
+    client.logout().catch(() => {}),
+    deleteRemoteSessionById(sessionName),
+    deleteRemoteSessionById(`RemoteAuth-${REMOTE_SESSION_CLIENT_ID}`),
+    deleteRemoteSessionById(REMOTE_SESSION_CLIENT_ID),
+    deleteAllRemoteSessions(),
+    fs.rm(path.resolve("./.wwebjs_auth"), { recursive: true, force: true }),
+    fs.rm(path.resolve("./.wwebjs_cache"), { recursive: true, force: true }),
+    fs.rm(path.resolve(process.cwd(), `${sessionName}.zip`), { force: true }),
+    fs.rm(path.resolve(process.cwd(), `RemoteAuth-${REMOTE_SESSION_CLIENT_ID}.zip`), { force: true }),
+  ]);
+  latestQrRaw = null;
+  latestQrDataUrl = null;
+  remoteSessionSaved = false;
+  readyAtSec = 0;
+  lastWaState = null;
+}
+
+async function requestRestart(reason = "restart") {
+  if (shutdownRequested) return;
+  shutdownRequested = true;
+  console.log(`↻ إعادة تشغيل العملية: ${reason}`);
+  await Promise.race([
+    saveRemoteSessionNow().catch((error) => console.warn("session save before restart skipped:", errorMessage(error))),
+    new Promise((resolve) => setTimeout(resolve, 5000)),
+  ]).catch(() => {});
+  try {
+    if (typeof unsubscribeOutbox === "function") unsubscribeOutbox();
+  } catch {}
+  setTimeout(() => process.exit(1), 500).unref?.();
+}
+
+async function gracefulExit(signal) {
+  if (shutdownRequested) return;
+  shutdownRequested = true;
+  console.log(`↻ إيقاف Railway (${signal}) — محاولة حفظ آخر جلسة قبل الخروج`);
+  await Promise.race([
+    saveRemoteSessionNow().catch((error) => console.warn("session save on shutdown skipped:", errorMessage(error))),
+    new Promise((resolve) => setTimeout(resolve, 8000)),
+  ]).catch(() => {});
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => gracefulExit("SIGTERM"));
+process.on("SIGINT", () => gracefulExit("SIGINT"));
+
 
 client.on("qr", async (qr) => {
   lastError = null;
@@ -296,8 +352,10 @@ client.on("remote_session_saved", async () => {
 client.on("auth_failure", async (m) => {
   lastError = errorMessage(m || "auth_failure");
   connectionState = "disconnected";
+  remoteSessionSaved = false;
+  await deleteAllRemoteSessions().catch(() => {});
   await logEvent("auth_failure", { message: String(m) });
-  await setConnectionState({ connectionState: "disconnected", status: "pending", waConnected: false });
+  await setConnectionState({ connectionState: "disconnected", status: "pending", waConnected: false, remoteSessionSaved: false, lastQr: null });
 });
 
 client.on("disconnected", async (reason) => {
@@ -306,10 +364,7 @@ client.on("disconnected", async (reason) => {
   lastWaState = String(reason || "disconnected");
   await logEvent("disconnected", { reason });
   await setConnectionState({ connectionState: "disconnected", status: "pending", waConnected: false });
-  setTimeout(() => {
-    console.log("↻ إعادة تشغيل العملية بعد فصل واتساب حتى يسترجع RemoteAuth الجلسة تلقائياً");
-    process.exit(1);
-  }, 1200).unref?.();
+  setTimeout(() => requestRestart("whatsapp disconnected"), 1200).unref?.();
 });
 
 setInterval(() => {
@@ -389,8 +444,7 @@ client.initialize().catch(async (error) => {
   console.error("client.initialize failed:", lastError);
   await setConnectionState({ connectionState: "init_error", status: "pending", waConnected: false, lastError }).catch(() => {});
   setTimeout(() => {
-    console.log("↻ إعادة تشغيل العملية بعد فشل تهيئة واتساب");
-    process.exit(1);
+    requestRestart("whatsapp initialize failed");
   }, 3000).unref?.();
 });
 
@@ -561,7 +615,7 @@ app.use((req, res, next) => {
 app.use(express.json());
 
 function auth(req) {
-  if (!SERVICE_TOKEN) return true;
+  if (!SERVICE_TOKEN) return false;
   const h = req.headers.authorization || "";
   return h === `Bearer ${SERVICE_TOKEN}`;
 }
@@ -593,6 +647,7 @@ app.get("/status", async (_req, res) => {
     qrDataUrl: latestQrDataUrl,
     lastError,
     remoteSessionSaved,
+    memory: process.memoryUsage(),
     remoteSessionClientId: REMOTE_SESSION_CLIENT_ID,
     readyAtSec,
     newMessageGraceSec: NEW_MESSAGE_GRACE_SEC,
@@ -621,10 +676,11 @@ app.post("/send", async (req, res) => {
 app.post("/logout", async (req, res) => {
   if (!auth(req)) return res.status(401).json({ error: "unauthorized" });
   try {
-    await client.logout().catch(() => {});
+    await clearLocalAndRemoteSession();
     connectionState = "disconnected";
-    await setConnectionState({ connectionState: "disconnected", status: "pending", waConnected: false, lastQr: null });
-    res.json({ ok: true });
+    await setConnectionState({ connectionState: "disconnected", status: "pending", waConnected: false, lastQr: null, remoteSessionSaved: false });
+    res.json({ ok: true, unlinked: true, restarting: true });
+    setTimeout(() => requestRestart("logout requested"), 300).unref?.();
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -633,24 +689,19 @@ app.post("/logout", async (req, res) => {
 app.post("/restart", async (req, res) => {
   if (!auth(req)) return res.status(401).json({ error: "unauthorized" });
   res.json({ ok: true });
-  setTimeout(() => process.exit(1), 300); // Railway يعيد التشغيل تلقائياً عبر restartPolicy
+  setTimeout(() => requestRestart("manual restart"), 300); // Railway يعيد التشغيل تلقائياً عبر restartPolicy
 });
 
 app.post("/reset-session", async (req, res) => {
   if (!auth(req)) return res.status(401).json({ error: "unauthorized" });
   try {
-    await client.logout().catch(() => {});
+    await clearLocalAndRemoteSession();
     await client.destroy().catch(() => {});
-    await deleteRemoteSessionById(client.authStrategy?.sessionName || `RemoteAuth-${REMOTE_SESSION_CLIENT_ID}`).catch(() => {});
-    await fs.rm(path.resolve("./.wwebjs_auth"), { recursive: true, force: true });
-    await fs.rm(path.resolve("./.wwebjs_cache"), { recursive: true, force: true });
-    latestQrRaw = null;
-    latestQrDataUrl = null;
     connectionState = "resetting";
     lastError = null;
-    await setConnectionState({ connectionState: "resetting", status: "pending", waConnected: false, lastQr: null });
-    res.json({ ok: true, restarting: true });
-    setTimeout(() => process.exit(1), 300); // Railway يعيد التشغيل ويولد QR جديد
+    await setConnectionState({ connectionState: "resetting", status: "pending", waConnected: false, lastQr: null, remoteSessionSaved: false });
+    res.json({ ok: true, unlinked: true, remoteSessionDeleted: true, restarting: true });
+    setTimeout(() => requestRestart("session reset requested"), 300); // Railway يعيد التشغيل ويولد QR جديد
   } catch (e) {
     lastError = errorMessage(e);
     res.status(500).json({ error: lastError });

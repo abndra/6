@@ -25,8 +25,11 @@ function readEmbeddedConfig() {
   }
 }
 const embeddedConfig = readEmbeddedConfig();
-const STORE_ID = process.env.TAYSIR_STORE_ID || embeddedConfig.storeId;
-const BOT_ID = process.env.TAYSIR_BOT_ID || embeddedConfig.botId;
+// ملفات GitHub الجديدة تضع معرف المتجر/البوت داخل bot.config.json.
+// نجعله المصدر الأول حتى لا تُبقي Railway متغيرات قديمة فتربط السيرفر ببوت/جلسة قديمة
+// بعد تحديث GitHub وإعادة النشر.
+const STORE_ID = embeddedConfig.storeId || process.env.TAYSIR_STORE_ID;
+const BOT_ID = embeddedConfig.botId || process.env.TAYSIR_BOT_ID;
 const db = getFirestore();
 
 

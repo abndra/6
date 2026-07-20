@@ -1,10 +1,10 @@
 {
   "botName": "أحمد",
-  "storeId": "GImHpxtibaQZzm3gpsHr",
-  "botId": "6axypinjJb2jBHq6Ncda",
+  "storeId": "ezdpW6w1VR3jqVCNCYQg",
+  "botId": "AfIvCqC5zS3d0OwBoYbb",
   "database": "supabase-documents",
-  "filesVersion": "4.2.0",
-  "filesVersionNote": "Instant mode: 0.5s queue watchers, fresh bot config on every message, parallel database writes",
+  "filesVersion": "4.3.0",
+  "filesVersionNote": "Stable sessions: bot.config wins over stale Railway IDs, lower memory defaults, quieter AI refresh logs, hard session reset",
   "architecture": "whatsapp-bridge + supabase documents aiQueue/outbox + groq ai-worker + supabase remote session",
   "messages": "الرسائل الجديدة فقط بعد الربط — لا استيراد للمحادثات القديمة",
   "endpoints": [

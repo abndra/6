@@ -37,7 +37,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV PUPPETEER_SKIP_DOWNLOAD=true \
     PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
     PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
-    NODE_OPTIONS=--max-old-space-size=384 \
+    NODE_OPTIONS=--max-old-space-size=256 \
+    MALLOC_ARENA_MAX=2 \
+    UV_THREADPOOL_SIZE=2 \
     NODE_ENV=production
 
 WORKDIR /app

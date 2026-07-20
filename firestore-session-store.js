@@ -107,4 +107,9 @@ async function deleteRemoteSessionById(session) {
   await sessionRef(session).delete().catch(() => {});
 }
 
-module.exports = { createFirestoreRemoteStore, deleteRemoteSessionById, SessionZipNotReadyError };
+async function deleteAllRemoteSessions() {
+  const docs = await botRef().collection("whatsappSessions").listDocuments().catch(() => []);
+  await Promise.all(docs.map((doc) => doc.delete().catch(() => {})));
+}
+
+module.exports = { createFirestoreRemoteStore, deleteRemoteSessionById, deleteAllRemoteSessions, SessionZipNotReadyError };
