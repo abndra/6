@@ -39,12 +39,13 @@ const {
 const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 const STALE_PROCESSING_MS = Number(process.env.AI_STALE_PROCESSING_MS || 120000);
 // السرعة أولاً: onSnapshot يلتقط الرسالة فوراً، polling كشبكة أمان بأدنى تأخير
-const AI_POLL_INTERVAL_MS = Math.max(500, Number(process.env.AI_POLL_INTERVAL_MS || 1000));
-const AI_RECOVER_INTERVAL_MS = Math.max(15000, Number(process.env.AI_RECOVER_INTERVAL_MS || 30000));
+// رفع الفاصل الافتراضي لتقليل استهلاك egress في Supabase (كان 1s → أصبح 5s)
+const AI_POLL_INTERVAL_MS = Math.max(500, Number(process.env.AI_POLL_INTERVAL_MS || 5000));
+const AI_RECOVER_INTERVAL_MS = Math.max(15000, Number(process.env.AI_RECOVER_INTERVAL_MS || 60000));
 const AI_GROQ_TIMEOUT_MS = Math.max(4000, Number(process.env.AI_GROQ_TIMEOUT_MS || 15000));
 const AI_MAX_CONCURRENT = Math.max(1, Math.min(3, Number(process.env.AI_MAX_CONCURRENT || 1)));
-const AI_CONFIG_REFRESH_MS = Math.max(30000, Number(process.env.AI_CONFIG_REFRESH_MS || 60000));
-const AI_HEARTBEAT_WRITE_MS = Math.max(5000, Number(process.env.AI_HEARTBEAT_WRITE_MS || 30000));
+const AI_CONFIG_REFRESH_MS = Math.max(30000, Number(process.env.AI_CONFIG_REFRESH_MS || 120000));
+const AI_HEARTBEAT_WRITE_MS = Math.max(5000, Number(process.env.AI_HEARTBEAT_WRITE_MS || 60000));
 const DEFAULT_CLOSED_MESSAGE = "نعتذر، المتجر مغلق حالياً. سنعود إليك عند الفتح.";
 const GROQ_FAST_MODEL = process.env.GROQ_FAST_MODEL || "llama-3.3-70b-versatile";
 const AI_HISTORY_LIMIT = Math.max(6, Math.min(20, Number(process.env.AI_HISTORY_LIMIT || 12)));

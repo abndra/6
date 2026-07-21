@@ -48,8 +48,9 @@ const now = () => FieldValue.serverTimestamp();
 // تقليل استهلاك قاعدة البيانات: لا نسجل أحداثاً تفصيلية إلا عند تفعيلها صراحة،
 // ونحتفظ بإعدادات البوت في الذاكرة حتى لا ينهار الرد عند ضغط/انقطاع مؤقت في الكوتا.
 const EVENT_LOG_ENABLED = String(process.env.EVENT_LOG_ENABLED || "false").toLowerCase() === "true";
-const CONFIG_CACHE_MS = Math.max(0, Number(process.env.SUPABASE_CONFIG_CACHE_MS || process.env.FIRESTORE_CONFIG_CACHE_MS || 1000));
-const CONNECTION_STATE_MIN_WRITE_MS = Math.max(1000, Number(process.env.CONNECTION_STATE_MIN_WRITE_MS || 5000));
+// كاش الإعدادات: افتراضياً 60 ثانية لتقليل قراءات Supabase (كان 1s)
+const CONFIG_CACHE_MS = Math.max(0, Number(process.env.SUPABASE_CONFIG_CACHE_MS || process.env.FIRESTORE_CONFIG_CACHE_MS || 60000));
+const CONNECTION_STATE_MIN_WRITE_MS = Math.max(1000, Number(process.env.CONNECTION_STATE_MIN_WRITE_MS || 30000));
 let botSecretsCache = { data: null, expiresAt: 0, lastErrorLogAt: 0 };
 let storeConfigCache = { data: null, expiresAt: 0, lastErrorLogAt: 0 };
 let lastConnectionStateWriteAt = 0;
@@ -346,7 +347,9 @@ async function queueOutgoingMessage(phone, text, { source = "api", chatId = null
 // سجل استهلاك التوكن — يُكتب في مجموعة فرعية للبوت
 // يستخدمه لوحة الأدمين لعرض تفاصيل كل عملية استهلاك
 // ============================================================
+const TOKEN_LEDGER_ENABLED = String(process.env.TOKEN_LEDGER_ENABLED || "false").toLowerCase() === "true";
 async function appendTokenLedger(entry = {}) {
+  if (!TOKEN_LEDGER_ENABLED) return; // معطل افتراضياً لتقليل استهلاك Supabase egress
   try {
     const doc = {
       at: now(),
@@ -360,8 +363,6 @@ async function appendTokenLedger(entry = {}) {
       source: entry.source ? String(entry.source) : null,
     };
     await botRef().collection("tokenLedger").add(doc);
-    // trim: احتفظ بآخر ~500 قيد فقط لتجنّب تضخّم الجدول.
-    // نعتمد على تنظيف دوري خارج هذه الدالة إن لزم.
   } catch (e) {
     console.error("appendTokenLedger:", e.message);
   }
