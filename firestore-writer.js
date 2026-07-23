@@ -14,6 +14,7 @@
 // ---- تهيئة طبقة التوافق (Supabase تحت الغطاء) ----
 const { admin, getFirestore, FieldValue } = require("./firestore-compat");
 const crypto = require("crypto");
+const { getPerf } = require("./perf-settings-reader");
 
 if (!admin.apps.length) admin.initializeApp();
 
@@ -45,11 +46,9 @@ const botRef = () => storeRef().collection("bots").doc(BOT_ID);
 const botSecretsRef = () => db.collection("stores").doc(STORE_ID).collection("botSecrets").doc(BOT_ID);
 const now = () => FieldValue.serverTimestamp();
 
-// تقليل استهلاك قاعدة البيانات: لا نسجل أحداثاً تفصيلية إلا عند تفعيلها صراحة،
-// ونحتفظ بإعدادات البوت في الذاكرة حتى لا ينهار الرد عند ضغط/انقطاع مؤقت في الكوتا.
-const EVENT_LOG_ENABLED = String(process.env.EVENT_LOG_ENABLED || "false").toLowerCase() === "true";
-// كاش الإعدادات: افتراضياً 60 ثانية لتقليل قراءات Supabase (كان 1s)
-const CONFIG_CACHE_MS = Math.max(0, Number(process.env.SUPABASE_CONFIG_CACHE_MS || process.env.FIRESTORE_CONFIG_CACHE_MS || 60000));
+// تقليل استهلاك قاعدة البيانات: EVENT_LOG_ENABLED والكاش تُقرأ ديناميكياً من perfSettings.
+function isEventLogEnabled() { return getPerf("EVENT_LOG_ENABLED"); }
+function configCacheMs() { return Math.max(0, getPerf("SUPABASE_configCacheMs()")); }
 const CONNECTION_STATE_MIN_WRITE_MS = Math.max(1000, Number(process.env.CONNECTION_STATE_MIN_WRITE_MS || 30000));
 let botSecretsCache = { data: null, expiresAt: 0, lastErrorLogAt: 0 };
 let storeConfigCache = { data: null, expiresAt: 0, lastErrorLogAt: 0 };
@@ -72,13 +71,13 @@ async function readCachedDoc(ref, cache, label) {
   try {
     const snap = await ref.get();
     cache.data = snap.exists ? snap.data() : {};
-    cache.expiresAt = t + CONFIG_CACHE_MS;
+    cache.expiresAt = t + configCacheMs();
     return cache.data;
   } catch (e) {
     logReadFailure(cache, label, e);
     if (cache.data) {
       // عند ضغط قاعدة البيانات نستمر بآخر إعداد معروف بدلاً من إسقاط Groq/المعرفة إلى قيم فارغة.
-      cache.expiresAt = t + (isQuotaError(e) ? CONFIG_CACHE_MS : 30_000);
+      cache.expiresAt = t + (isQuotaError(e) ? configCacheMs() : 30_000);
       return cache.data;
     }
     return {};
@@ -89,7 +88,7 @@ async function readFreshDoc(ref, cache, label, options = {}) {
   try {
     const snap = await ref.get();
     cache.data = snap.exists ? snap.data() : {};
-    cache.expiresAt = Date.now() + CONFIG_CACHE_MS;
+    cache.expiresAt = Date.now() + configCacheMs();
     return cache.data;
   } catch (e) {
     logReadFailure(cache, label, e);
@@ -391,7 +390,7 @@ async function markOutboxError(outboxId, message) {
 // 6) سجل الأحداث
 // ============================================================
 async function logEvent(type, payload = {}) {
-  if (!EVENT_LOG_ENABLED) return;
+  if (!isEventLogEnabled()) return;
   try {
     await botRef().collection("events").add({ type, payload, at: now() });
   } catch (e) {

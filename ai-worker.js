@@ -34,18 +34,13 @@ const {
   markPoolGroqActive,
   runPoolGroqAutoRenewal,
 } = require("./firestore-writer");
+const { getPerf } = require("./perf-settings-reader");
 
-// نموذج أذكى بكثير من 8b — يفهم السياق واللهجات بدقة عالية جداً
 const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 const STALE_PROCESSING_MS = Number(process.env.AI_STALE_PROCESSING_MS || 120000);
-// السرعة أولاً: onSnapshot يلتقط الرسالة فوراً، polling كشبكة أمان بأدنى تأخير
-// رفع الفاصل الافتراضي لتقليل استهلاك egress في Supabase (كان 1s → أصبح 5s)
-const AI_POLL_INTERVAL_MS = Math.max(500, Number(process.env.AI_POLL_INTERVAL_MS || 5000));
-const AI_RECOVER_INTERVAL_MS = Math.max(15000, Number(process.env.AI_RECOVER_INTERVAL_MS || 60000));
+const AI_RECOVER_INTERVAL_MS = Math.max(60000, Number(process.env.AI_RECOVER_INTERVAL_MS || 300000));
 const AI_GROQ_TIMEOUT_MS = Math.max(4000, Number(process.env.AI_GROQ_TIMEOUT_MS || 15000));
 const AI_MAX_CONCURRENT = Math.max(1, Math.min(3, Number(process.env.AI_MAX_CONCURRENT || 1)));
-const AI_CONFIG_REFRESH_MS = Math.max(30000, Number(process.env.AI_CONFIG_REFRESH_MS || 120000));
-const AI_HEARTBEAT_WRITE_MS = Math.max(5000, Number(process.env.AI_HEARTBEAT_WRITE_MS || 60000));
 const DEFAULT_CLOSED_MESSAGE = "نعتذر، المتجر مغلق حالياً. سنعود إليك عند الفتح.";
 const GROQ_FAST_MODEL = process.env.GROQ_FAST_MODEL || "llama-3.3-70b-versatile";
 const AI_HISTORY_LIMIT = Math.max(6, Math.min(20, Number(process.env.AI_HISTORY_LIMIT || 12)));
@@ -304,9 +299,14 @@ async function refreshConfigFromSupabase(reason = "interval") {
 
 // مهم: لا نستخدم مراقبة مباشرة على وثيقة البوت لأنها تتغير مع كل health/status heartbeat.
 refreshConfigFromSupabase("startup").catch(() => {});
-setInterval(() => {
-  refreshConfigFromSupabase("interval").catch(() => {});
-}, AI_CONFIG_REFRESH_MS).unref?.();
+function scheduleConfigRefresh() {
+  const delay = Math.max(60000, getPerf("AI_CONFIG_REFRESH_MS"));
+  setTimeout(() => {
+    refreshConfigFromSupabase("interval").catch(() => {});
+    scheduleConfigRefresh();
+  }, delay).unref?.();
+}
+scheduleConfigRefresh();
 
 // ============================================================
 // مطابقة فورية من إعدادات البوت (بدون Groq)
@@ -1538,6 +1538,7 @@ async function processJob(phone, body, msgId, chatId = null) {
 const processing = new Set();
 let unsubscribeAiQueue = null;
 let aiListenerRetryTimer = null;
+let aiListenerRetryDelayMs = 30000;
 let drainingQueue = false;
 
 function canStartMoreJobs() {
@@ -1552,6 +1553,7 @@ function startQueueDoc(doc) {
 }
 
 function attachAiQueueListener() {
+  if (String(process.env.SNAPSHOT_LISTENERS_ENABLED || "false").toLowerCase() !== "true") return;
   try {
     if (typeof unsubscribeAiQueue === "function") unsubscribeAiQueue();
   } catch {}
@@ -1567,9 +1569,12 @@ function attachAiQueueListener() {
       },
       (err) => {
         console.error("aiQueue listener error:", err.message);
-        logEvent("ai_listener_error", { message: err.message }).catch(() => {});
+        if (!/restricted|egress|quota/i.test(String(err.message || ""))) {
+          logEvent("ai_listener_error", { message: err.message }).catch(() => {});
+        }
         clearTimeout(aiListenerRetryTimer);
-        aiListenerRetryTimer = setTimeout(attachAiQueueListener, 5000);
+        aiListenerRetryTimer = setTimeout(attachAiQueueListener, aiListenerRetryDelayMs);
+        aiListenerRetryDelayMs = Math.min(aiListenerRetryDelayMs * 2, 5 * 60 * 1000);
         aiListenerRetryTimer.unref?.();
       },
     );
@@ -1605,7 +1610,8 @@ async function drainPendingJobs(reason = "poll") {
       if (!started) break;
     }
     const t = Date.now();
-    if (t - lastAiHeartbeatAt >= AI_HEARTBEAT_WRITE_MS) {
+    const hb = Math.max(60000, getPerf("AI_HEARTBEAT_WRITE_MS"));
+    if (t - lastAiHeartbeatAt >= hb) {
       lastAiHeartbeatAt = t;
       await botRef().set(
         {
@@ -1618,8 +1624,12 @@ async function drainPendingJobs(reason = "poll") {
       );
     }
   } catch (e) {
-    console.error("ai queue drain error:", e.message);
-    await logEvent("ai_queue_drain_error", { message: e.message }).catch(() => {});
+    if (/restricted|egress|quota/i.test(String(e.message || ""))) {
+      console.error("ai queue paused by platform quota:", e.message);
+    } else {
+      console.error("ai queue drain error:", e.message);
+      await logEvent("ai_queue_drain_error", { message: e.message }).catch(() => {});
+    }
   } finally {
     drainingQueue = false;
   }
@@ -1656,9 +1666,14 @@ async function handleQueueDoc(doc) {
 console.log("🤖 عامل الذكاء (Groq) يعمل ويستمع لطابور الرسائل...");
 attachAiQueueListener();
 
-setInterval(() => {
-  drainPendingJobs("interval").catch(() => {});
-}, AI_POLL_INTERVAL_MS).unref?.();
+function scheduleAiPoll() {
+  const delay = Math.max(3000, getPerf("AI_POLL_INTERVAL_MS"));
+  setTimeout(() => {
+    drainPendingJobs("interval").catch(() => {});
+    scheduleAiPoll();
+  }, delay).unref?.();
+}
+scheduleAiPoll();
 
 setInterval(() => {
   recoverStuckJobs().catch((e) => console.error("recover stuck jobs error:", e.message));

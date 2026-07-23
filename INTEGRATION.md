@@ -71,10 +71,11 @@ Restart أو Deploy في Railway ولا يظهر الهاتف كأنه سجّل 
 | `TAYSIR_STORE_ID` | id المتجر (`stores/xxxx`) |
 | `TAYSIR_BOT_ID` | id البوت (`stores/xxx/bots/yyy`) |
 | `SERVICE_TOKEN` | إجباري — نفس قيمة `railwayApiKey` في إعدادات البوت |
-| `AI_POLL_INTERVAL_MS` | (اختياري) افتراضي 500ms — فحص احتياطي سريع لطابور الذكاء |
-| `OUTBOX_POLL_INTERVAL_MS` | (اختياري) افتراضي 500ms — فحص احتياطي سريع لطابور الإرسال |
-| `SNAPSHOT_POLL_INTERVAL_MS` | (اختياري) افتراضي 500ms — سرعة مراقبة الطوابير لحظياً |
-| `SUPABASE_CONFIG_CACHE_MS` | (اختياري) افتراضي 1000ms — كاش قصير جداً؛ الإعدادات تُقرأ مباشرة مع كل رسالة |
+| `AI_POLL_INTERVAL_MS` | (اختياري) افتراضي 15000ms — فحص مخفف لطابور الذكاء لتقليل egress |
+| `OUTBOX_POLL_INTERVAL_MS` | (اختياري) افتراضي 15000ms — فحص مخفف لطابور الإرسال لتقليل egress |
+| `SNAPSHOT_LISTENERS_ENABLED` | (اختياري) افتراضي false — لا تفعّله على الخطط الصغيرة لأنه يستخدم polling مستمر |
+| `SNAPSHOT_POLL_INTERVAL_MS` | (اختياري) افتراضي 60000ms عند تفعيل listeners فقط |
+| `SUPABASE_CONFIG_CACHE_MS` | (اختياري) افتراضي 60000ms — كاش إعدادات لتقليل قراءات قاعدة البيانات |
 | `MESSAGE_SWEEP_ENABLED` | (اختياري) افتراضي false — لا تفعّله إلا للتشخيص لأنه يقرأ محادثات واتساب |
 | `EVENT_LOG_ENABLED` | (اختياري) افتراضي false — يقلّل كتابات/قراءات سجل الأحداث |
 

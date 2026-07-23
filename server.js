@@ -38,26 +38,20 @@ const {
   customerIdFromJid,
 } = require("./firestore-writer");
 const { createFirestoreRemoteStore, deleteRemoteSessionById, deleteAllRemoteSessions } = require("./firestore-session-store");
+const { getPerf } = require("./perf-settings-reader");
 
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "";
 if (!SERVICE_TOKEN) {
   console.error("SERVICE_TOKEN is required. أضفه في Railway بنفس قيمة railwayApiKey في لوحة تيسير.");
 }
-// نقبل الرسائل القريبة من لحظة الربط حتى لا تُرفض بسبب فرق توقيت واتساب،
-// وفي نفس الوقت لا نستورد المحادثات القديمة جداً.
 const NEW_MESSAGE_GRACE_SEC = Number(process.env.NEW_MESSAGE_GRACE_SEC || 45);
-// حفظ جلسة RemoteAuth عملية ضغط/رفع ثقيلة. كل دقيقة كان يسبب تداخل حفظ + استهلاك ذاكرة.
-// خمس دقائق كافية لحفظ الجلسة باستمرار وتمنع OOM على خطط Railway الصغيرة.
-const REMOTE_SESSION_BACKUP_MS = Math.max(60000, Number(process.env.REMOTE_SESSION_BACKUP_MS || 300000));
+// هذه ثلاث قيم تُقرأ مرة واحدة عند الإقلاع (تتطلب إعادة نشر لتغييرها):
+const REMOTE_SESSION_BACKUP_MS = Math.max(60000, Number(process.env.REMOTE_SESSION_BACKUP_MS || getPerf("REMOTE_SESSION_BACKUP_MS")));
 const REMOTE_SESSION_CLIENT_ID = String(process.env.REMOTE_SESSION_CLIENT_ID || `${STORE_ID}_${BOT_ID}`).replace(/[^a-z0-9_-]/gi, "_");
-const OUTBOX_POLL_INTERVAL_MS = Math.max(250, Number(process.env.OUTBOX_POLL_INTERVAL_MS || 3000));
-// getChats/fetchMessages يحمّل بيانات كثيرة من واتساب. نجعله شبكة أمان خفيفة فقط، لا فحصاً كل 30 ثانية.
-const MESSAGE_SWEEP_ENABLED = String(process.env.MESSAGE_SWEEP_ENABLED || "false").toLowerCase() === "true";
+const MESSAGE_SWEEP_ENABLED = getPerf("MESSAGE_SWEEP_ENABLED");
 const MESSAGE_SWEEP_INTERVAL_MS = Math.max(300000, Number(process.env.MESSAGE_SWEEP_INTERVAL_MS || 600000));
 const MESSAGE_SWEEP_LIMIT = Math.max(3, Math.min(10, Number(process.env.MESSAGE_SWEEP_LIMIT || 5)));
 const WA_STATE_TIMEOUT_MS = Math.max(3000, Number(process.env.WA_STATE_TIMEOUT_MS || 7000));
-const CONNECTION_VERIFY_INTERVAL_MS = Math.max(30000, Number(process.env.CONNECTION_VERIFY_INTERVAL_MS || 60000));
-const OUTBOX_HEARTBEAT_WRITE_MS = Math.max(5000, Number(process.env.OUTBOX_HEARTBEAT_WRITE_MS || 30000));
 let shutdownRequested = false;
 
 // ---- عميل واتساب ----
@@ -367,9 +361,11 @@ client.on("disconnected", async (reason) => {
   setTimeout(() => requestRestart("whatsapp disconnected"), 1200).unref?.();
 });
 
-setInterval(() => {
-  triggerConnectionVerify();
-}, CONNECTION_VERIFY_INTERVAL_MS).unref?.();
+function scheduleConnectionVerify() {
+  const delay = Math.max(15000, getPerf("CONNECTION_VERIFY_INTERVAL_MS"));
+  setTimeout(() => { triggerConnectionVerify(); scheduleConnectionVerify(); }, delay).unref?.();
+}
+scheduleConnectionVerify();
 
 async function handleIncomingMessage(msg, source = "event") {
   try {
@@ -454,6 +450,7 @@ client.initialize().catch(async (error) => {
 const sending = new Set(); // منع الإرسال المزدوج لنفس الوثيقة
 let unsubscribeOutbox = null;
 let outboxListenerRetryTimer = null;
+let outboxListenerRetryDelayMs = 30000;
 
 function startOutboxDoc(doc) {
   if (!doc?.id || sending.has(doc.id)) return false;
@@ -463,6 +460,7 @@ function startOutboxDoc(doc) {
 }
 
 function attachOutboxListener() {
+  if (!getPerf("SNAPSHOT_LISTENERS_ENABLED")) return;
   try {
     if (typeof unsubscribeOutbox === "function") unsubscribeOutbox();
   } catch {}
@@ -478,9 +476,12 @@ function attachOutboxListener() {
       },
       (err) => {
         console.error("outbox listener error:", err.message);
-        logEvent("outbox_listener_error", { message: err.message }).catch(() => {});
+        if (!/restricted|egress|quota/i.test(String(err.message || ""))) {
+          logEvent("outbox_listener_error", { message: err.message }).catch(() => {});
+        }
         clearTimeout(outboxListenerRetryTimer);
-        outboxListenerRetryTimer = setTimeout(attachOutboxListener, 5000);
+        outboxListenerRetryTimer = setTimeout(attachOutboxListener, outboxListenerRetryDelayMs);
+        outboxListenerRetryDelayMs = Math.min(outboxListenerRetryDelayMs * 2, 5 * 60 * 1000);
         outboxListenerRetryTimer.unref?.();
       },
     );
@@ -491,7 +492,8 @@ async function drainPendingOutbox(reason = "poll") {
   const pend = await botRef().collection("outbox").where("status", "==", "pending").limit(10).get();
   pend.forEach((d) => startOutboxDoc(d));
   const t = Date.now();
-  if (t - lastOutboxHeartbeatAt >= OUTBOX_HEARTBEAT_WRITE_MS) {
+  const hb = Math.max(60000, getPerf("OUTBOX_HEARTBEAT_WRITE_MS"));
+  if (t - lastOutboxHeartbeatAt >= hb) {
     lastOutboxHeartbeatAt = t;
     await setConnectionState({ outboxHeartbeatAt: admin.firestore.FieldValue.serverTimestamp(), outboxPendingSeen: pend.size, outboxLastDrainReason: reason });
   }
@@ -499,9 +501,14 @@ async function drainPendingOutbox(reason = "poll") {
 
 attachOutboxListener();
 
-setInterval(() => {
-  drainPendingOutbox("interval").catch((e) => console.error("outbox drain error:", e.message));
-}, OUTBOX_POLL_INTERVAL_MS).unref?.();
+function scheduleOutboxDrain() {
+  const delay = Math.max(3000, getPerf("OUTBOX_POLL_INTERVAL_MS"));
+  setTimeout(() => {
+    drainPendingOutbox("interval").catch((e) => console.error("outbox drain error:", e.message));
+    scheduleOutboxDrain();
+  }, delay).unref?.();
+}
+scheduleOutboxDrain();
 
 // تحميل الصورة في Node (مع مهلة وحد أقصى للحجم) بدل MessageMedia.fromUrl —
 // لأن fromUrl يحمّل الصورة داخل متصفح واتساب وقد يعلّق الجلسة أو يقطع الاتصال.

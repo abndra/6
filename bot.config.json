@@ -1,10 +1,10 @@
 {
-  "botName": "نورة",
-  "storeId": "SAeFS92CbbFnRiVPRUtD",
-  "botId": "GpudDcob1rdfjhAC5mFN",
+  "botName": "NURA",
+  "storeId": "ijErPtzCrAksQpnPSqWI",
+  "botId": "ck4y0b3GIXqWlJRtNi06",
   "database": "supabase-documents",
-  "filesVersion": "4.3.0",
-  "filesVersionNote": "Stable sessions: bot.config wins over stale Railway IDs, lower memory defaults, quieter AI refresh logs, hard session reset",
+  "filesVersion": "4.5.0",
+  "filesVersionNote": "Runtime perfSettings from Supabase: تحكم بسرعة القراءة/الإرسال من لوحة الأدمين → الإعدادات، بدون إعادة نشر.",
   "architecture": "whatsapp-bridge + supabase documents aiQueue/outbox + groq ai-worker + supabase remote session",
   "messages": "الرسائل الجديدة فقط بعد الربط — لا استيراد للمحادثات القديمة",
   "endpoints": [
@@ -36,6 +36,7 @@
     "AI_MAX_CONCURRENT",
     "OUTBOX_POLL_INTERVAL_MS",
     "SNAPSHOT_POLL_INTERVAL_MS",
+    "SNAPSHOT_LISTENERS_ENABLED",
     "MESSAGE_SWEEP_ENABLED",
     "MESSAGE_SWEEP_INTERVAL_MS",
     "MESSAGE_SWEEP_LIMIT",

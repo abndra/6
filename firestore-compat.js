@@ -25,7 +25,11 @@ const SUPABASE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY ||
   process.env.SUPABASE_SECRET_KEY;
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "";
-const SNAPSHOT_POLL_INTERVAL_MS = Math.max(150, Number(process.env.SNAPSHOT_POLL_INTERVAL_MS || 500));
+// ملاحظة مهمة: هذه الطبقة لا تستخدم Realtime حقيقي؛ onSnapshot هنا كان polling كل 500ms.
+// هذا سبّب استهلاك egress عالي جداً على Railway/Supabase حتى بدون رسائل.
+// لذلك نعطّله افتراضياً ونترك المعالجة لفواصل AI/OUTBOX الخفيفة أدناه.
+const SNAPSHOT_LISTENERS_ENABLED = String(process.env.SNAPSHOT_LISTENERS_ENABLED || "false").toLowerCase() === "true";
+const SNAPSHOT_POLL_INTERVAL_MS = Math.max(15000, Number(process.env.SNAPSHOT_POLL_INTERVAL_MS || 60000));
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   throw new Error(
@@ -34,7 +38,7 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 }
 
 if (!SERVICE_TOKEN) {
-  throw new Error("SERVICE_TOKEN missing: ضعه في Railway بنفس القيمة المحفوظة داخل إعدادات البوت");
+  console.error("SERVICE_TOKEN missing: ضعه في Railway بنفس القيمة المحفوظة داخل إعدادات البوت");
 }
 
 function makeFetch(key) {
@@ -47,7 +51,7 @@ function makeFetch(key) {
       headers.delete("Authorization");
     }
     headers.set("apikey", key);
-    headers.set("x-service-token", SERVICE_TOKEN);
+    if (SERVICE_TOKEN) headers.set("x-service-token", SERVICE_TOKEN);
     return fetch(input, { ...init, headers });
   };
 }
@@ -277,6 +281,10 @@ function collRef(path, cgroup) {
       return rows.map((r) => docRef(r.path));
     },
     onSnapshot(onNext, onError) {
+      if (!SNAPSHOT_LISTENERS_ENABLED) {
+        // لا polling خفي افتراضياً. الدوال الدورية في ai-worker/server هي المسؤولة عن السحب.
+        return () => {};
+      }
       let stopped = false;
       let last = new Map(); // path -> JSON hash
       const tick = async () => {
