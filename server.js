@@ -15,7 +15,7 @@
 // dependencies: whatsapp-web.js qrcode-terminal qrcode @supabase/supabase-js express
 // ============================================================
 
-const { Client, RemoteAuth, MessageMedia } = require("whatsapp-web.js");
+const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 const qrcodeTerminal = require("qrcode-terminal");
 const QRCode = require("qrcode");
 const express = require("express");
@@ -37,7 +37,7 @@ const {
   isRealCustomer,
   customerIdFromJid,
 } = require("./firestore-writer");
-const { createFirestoreRemoteStore, deleteRemoteSessionById, deleteAllRemoteSessions } = require("./firestore-session-store");
+const { deleteRemoteSessionById, deleteAllRemoteSessions } = require("./firestore-session-store");
 const { getPerf } = require("./perf-settings-reader");
 const { cleanEnvValue } = require("./env");
 
@@ -45,15 +45,15 @@ const SERVICE_TOKEN = cleanEnvValue("SERVICE_TOKEN");
 if (!SERVICE_TOKEN) {
   console.error("SERVICE_TOKEN is required. أضفه في Railway بنفس قيمة railwayApiKey في لوحة تيسير.");
 }
-const NEW_MESSAGE_GRACE_SEC = Number(process.env.NEW_MESSAGE_GRACE_SEC || 45);
+const NEW_MESSAGE_GRACE_SEC = Math.max(0, Number(process.env.NEW_MESSAGE_GRACE_SEC || 0));
 // هذه ثلاث قيم تُقرأ مرة واحدة عند الإقلاع (تتطلب إعادة نشر لتغييرها):
-const REMOTE_SESSION_BACKUP_MS = Math.max(60000, Number(process.env.REMOTE_SESSION_BACKUP_MS || getPerf("REMOTE_SESSION_BACKUP_MS")));
 const REMOTE_SESSION_CLIENT_ID = String(process.env.REMOTE_SESSION_CLIENT_ID || `${STORE_ID}_${BOT_ID}`).replace(/[^a-z0-9_-]/gi, "_");
-const FIRST_REMOTE_SESSION_SAVE_MS = Math.max(20000, Number(process.env.FIRST_REMOTE_SESSION_SAVE_MS || 30000));
 const MESSAGE_SWEEP_ENABLED = getPerf("MESSAGE_SWEEP_ENABLED");
 const MESSAGE_SWEEP_INTERVAL_MS = Math.max(300000, Number(process.env.MESSAGE_SWEEP_INTERVAL_MS || 600000));
 const MESSAGE_SWEEP_LIMIT = Math.max(3, Math.min(10, Number(process.env.MESSAGE_SWEEP_LIMIT || 5)));
 const WA_STATE_TIMEOUT_MS = Math.max(3000, Number(process.env.WA_STATE_TIMEOUT_MS || 7000));
+const STARTED_AT_MS = Date.now();
+const OUTBOX_ACCEPT_AFTER_MS = STARTED_AT_MS - Math.max(0, Number(process.env.OUTBOX_STARTUP_GRACE_MS || 15000));
 let shutdownRequested = false;
 
 // ---- عميل واتساب ----
@@ -94,11 +94,11 @@ if (process.env.CHROMIUM_EXTRA_ARGS) {
 }
 
 const client = new Client({
-  authStrategy: new RemoteAuth({
+  // لا نحفظ الجلسة في Supabase نهائياً. LocalAuth يحافظ على جلسة المتصفح داخل نفس
+  // تشغيل Railway فقط، وعند إعادة نشر/تصفير البيئة يظهر QR جديد بدون أي تعارض قديم.
+  authStrategy: new LocalAuth({
     clientId: REMOTE_SESSION_CLIENT_ID,
     dataPath: "./.wwebjs_auth",
-    store: createFirestoreRemoteStore(),
-    backupSyncIntervalMs: REMOTE_SESSION_BACKUP_MS,
   }),
   userAgent: TAYSIR_USER_AGENT,
   // لا نأخذ الجلسة بالقوة أثناء أول ربط. في بعض حسابات واتساب كان takeover الفوري
@@ -165,7 +165,6 @@ let connectionState = "disconnected";
 let lastWaState = null;
 let lastError = null;
 let remoteSessionSaved = false;
-let savingRemoteSession = false;
 let statusVerifyInFlight = null;
 const recentAutoSends = new Set();
 let lastOutboxHeartbeatAt = 0;
@@ -181,41 +180,20 @@ function isHealthyWaState(state) {
   return ["CONNECTED", "OPEN", "PAIRING", "TIMEOUT"].includes(value);
 }
 
-function installRemoteSessionSaveLock() {
-  const strategy = client.authStrategy;
-  if (!strategy || typeof strategy.storeRemoteSession !== "function" || strategy.__taysirSaveLockInstalled) return;
-  const originalStoreRemoteSession = strategy.storeRemoteSession.bind(strategy);
-  let saveChain = Promise.resolve();
-
-  strategy.storeRemoteSession = async (options) => {
-    const run = async () => {
-      try {
-        await originalStoreRemoteSession(options);
-      } catch (error) {
-        const message = errorMessage(error);
-        // خطأ ناعم متوقع: ملف الـ zip لم يجهز بعد (تهيئة المتصفح/أول دقائق بعد الربط).
-        // نتخطّاه بهدوء دون تلويث حالة الاتصال — الحفظ ينجح في الدورة التالية.
-        const isBenign = error?.benign || error?.name === "SessionZipNotReadyError" || /ENOENT/.test(message);
-        if (isBenign) {
-          console.log("ℹ️ تأجيل حفظ الجلسة (لم يجهز ملف النسخة بعد) — ستُحفظ في الدورة التالية");
-          return;
-        }
-        lastError = message;
-        console.error("remote session save skipped:", message);
-        await setConnectionState({ lastError, remoteSessionSaveErrorAt: admin.firestore.FieldValue.serverTimestamp() }).catch(() => {});
-        // لا نرمي الخطأ هنا: RemoteAuth يستدعي الحفظ من interval داخلي، والرمي كان يصنع
-        // unhandledRejection ويترك العملية بحالة غير مستقرة. سيُعاد الحفظ في الدورة التالية.
-      }
-    };
-
-    const next = saveChain.catch(() => {}).then(run);
-    saveChain = next.catch(() => {});
-    return next;
-  };
-  strategy.__taysirSaveLockInstalled = true;
+function timestampToMs(value) {
+  if (!value) return 0;
+  if (typeof value?.toMillis === "function") return value.toMillis();
+  if (typeof value?.seconds === "number") return value.seconds * 1000;
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === "number") return value;
+  if (typeof value === "string") return Date.parse(value) || 0;
+  return 0;
 }
 
-installRemoteSessionSaveLock();
+function isOlderThanBridgeStart(value) {
+  const ms = timestampToMs(value);
+  return !!ms && ms < OUTBOX_ACCEPT_AFTER_MS;
+}
 
 async function verifyConnectionState({ persist = false } = {}) {
   if (connectionState !== "connected") return { connected: false, state: lastWaState || connectionState };
@@ -249,14 +227,7 @@ function triggerConnectionVerify() {
 }
 
 async function saveRemoteSessionNow() {
-  if (savingRemoteSession) return;
-  if (typeof client.authStrategy?.storeRemoteSession !== "function") return;
-  savingRemoteSession = true;
-  try {
-    await client.authStrategy.storeRemoteSession({ emit: true });
-  } finally {
-    savingRemoteSession = false;
-  }
+  // تم تعطيل حفظ الجلسة البعيد عمداً لتجنب تعارضات تسجيل الخروج المفاجئ.
 }
 
 process.on("unhandledRejection", (error) => {
@@ -293,10 +264,6 @@ async function requestRestart(reason = "restart") {
   if (shutdownRequested) return;
   shutdownRequested = true;
   console.log(`↻ إعادة تشغيل العملية: ${reason}`);
-  await Promise.race([
-    saveRemoteSessionNow().catch((error) => console.warn("session save before restart skipped:", errorMessage(error))),
-    new Promise((resolve) => setTimeout(resolve, 5000)),
-  ]).catch(() => {});
   try {
     if (typeof unsubscribeOutbox === "function") unsubscribeOutbox();
   } catch {}
@@ -306,11 +273,7 @@ async function requestRestart(reason = "restart") {
 async function gracefulExit(signal) {
   if (shutdownRequested) return;
   shutdownRequested = true;
-  console.log(`↻ إيقاف Railway (${signal}) — محاولة حفظ آخر جلسة قبل الخروج`);
-  await Promise.race([
-    saveRemoteSessionNow().catch((error) => console.warn("session save on shutdown skipped:", errorMessage(error))),
-    new Promise((resolve) => setTimeout(resolve, 8000)),
-  ]).catch(() => {});
+  console.log(`↻ إيقاف Railway (${signal})`);
   process.exit(0);
 }
 
@@ -339,7 +302,7 @@ client.on("ready", async () => {
   latestQrDataUrl = null;
   readyAtSec = Math.floor(Date.now() / 1000) - NEW_MESSAGE_GRACE_SEC;
   lastWaState = "CONNECTED";
-  console.log("✓ WhatsApp متصل — سيتم حفظ الرسائل الجديدة فقط بعد هذه اللحظة");
+  console.log("✓ WhatsApp متصل — لا يوجد حفظ جلسة بعيد، والردود تبدأ من الرسائل الجديدة فقط");
   await logEvent("connected");
 
   await setConnectionState({
@@ -350,21 +313,15 @@ client.on("ready", async () => {
     phoneNumber: client.info?.wid?.user || null,
     connectedAt: admin.firestore.FieldValue.serverTimestamp(),
     remoteSessionSaved,
+    sessionPersistence: "local-only-no-remote-save",
     waState: lastWaState,
   });
-
-  // نحفظ نسخة أولى بعد استقرار الربط بقليل. إذا أُعيد نشر Railway قبل أول دورة RemoteAuth
-  // فلن تضيع الجلسة ولن يظهر QR جديد بلا سبب.
-  setTimeout(() => {
-    saveRemoteSessionNow().catch((error) => console.warn("first remote session save skipped:", errorMessage(error)));
-  }, FIRST_REMOTE_SESSION_SAVE_MS).unref?.();
 });
 
 client.on("remote_session_saved", async () => {
-  remoteSessionSaved = true;
-  console.log("✓ تم حفظ جلسة واتساب في Supabase — لن تضيع بعد Restart/Deploy");
-  await logEvent("remote_session_saved", {});
-  await setConnectionState({ remoteSessionSaved: true });
+  remoteSessionSaved = false;
+  console.log("ℹ️ تم تجاهل حفظ الجلسة البعيد لأنه معطل في هذه النسخة");
+  await setConnectionState({ remoteSessionSaved: false, sessionPersistence: "local-only-no-remote-save" });
 });
 
 client.on("auth_failure", async (m) => {
@@ -577,6 +534,10 @@ async function sendOne(doc) {
     await markOutboxError(doc.id, "missing phone/text");
     return;
   }
+  if (isOlderThanBridgeStart(data.createdAt)) {
+    await markOutboxError(doc.id, "skipped old outbox from previous deployment");
+    return;
+  }
   if (connectionState !== "connected") {
     // واتساب غير متصل الآن — نتركها pending لتُرسل عند عودة الاتصال
     return;
@@ -678,6 +639,7 @@ app.get("/status", async (_req, res) => {
     qrDataUrl: latestQrDataUrl,
     lastError,
     remoteSessionSaved,
+    sessionPersistence: "local-only-no-remote-save",
     memory: process.memoryUsage(),
     remoteSessionClientId: REMOTE_SESSION_CLIENT_ID,
     readyAtSec,

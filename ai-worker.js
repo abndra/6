@@ -49,6 +49,8 @@ const AI_PROMPT_PRODUCT_LIMIT = Math.max(0, Math.min(30, Number(process.env.AI_P
 const AI_PROMPT_TEXT_LIMIT = Math.max(80, Number(process.env.AI_PROMPT_TEXT_LIMIT || 600));
 const AI_RESPONSE_CACHE_MS = Math.max(0, Number(process.env.AI_RESPONSE_CACHE_MS || 5 * 60 * 1000));
 const AI_MAX_MESSAGE_CHARS = Math.max(200, Number(process.env.AI_MAX_MESSAGE_CHARS || 1200));
+const WORKER_STARTED_AT_MS = Date.now();
+const AI_QUEUE_ACCEPT_AFTER_MS = WORKER_STARTED_AT_MS - Math.max(0, Number(process.env.AI_QUEUE_STARTUP_GRACE_MS || 15000));
 
 const responseCache = new Map();
 
@@ -1130,6 +1132,21 @@ function makeDedupKey(...parts) {
   return parts.map((p) => String(p || "").trim().toLowerCase()).filter(Boolean).join("|").slice(0, 200);
 }
 
+function timestampToMs(value) {
+  if (!value) return 0;
+  if (typeof value?.toMillis === "function") return value.toMillis();
+  if (typeof value?.seconds === "number") return value.seconds * 1000;
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === "number") return value;
+  if (typeof value === "string") return Date.parse(value) || 0;
+  return 0;
+}
+
+function isOlderThanWorkerStart(value) {
+  const ms = timestampToMs(value);
+  return !!ms && ms < AI_QUEUE_ACCEPT_AFTER_MS;
+}
+
 async function extractAndLogOrder(phone, userText, botText, history = []) {
   const keys = Array.isArray(botConfig.groqApiKeys) ? botConfig.groqApiKeys.filter((k) => k && k.key && !k.disabled) : [];
   if (!keys.length) return;
@@ -1637,13 +1654,23 @@ async function drainPendingJobs(reason = "poll") {
 
 async function handleQueueDoc(doc) {
   const ref = doc.ref;
+  const initialData = doc.data() || {};
+  if (isOlderThanWorkerStart(initialData.createdAt)) {
+    await ref.set({ status: "skipped", skippedAt: new Date(), skipReason: "old job from previous deployment" }, { merge: true }).catch(() => {});
+    return;
+  }
   // نطالب بالوثيقة عبر transaction لمنع المعالجة المزدوجة
   let claimed = false;
   try {
     await botRef().firestore.runTransaction(async (tx) => {
       const fresh = await tx.get(ref);
       if (!fresh.exists) return;
-      if (fresh.data().status !== "pending") return;
+      const freshData = fresh.data() || {};
+      if (freshData.status !== "pending") return;
+      if (isOlderThanWorkerStart(freshData.createdAt)) {
+        tx.update(ref, { status: "skipped", skippedAt: FieldValue.serverTimestamp(), skipReason: "old job from previous deployment" });
+        return;
+      }
       tx.update(ref, { status: "processing", claimedAt: FieldValue.serverTimestamp() });
       claimed = true;
     });
@@ -1653,7 +1680,7 @@ async function handleQueueDoc(doc) {
   }
   if (!claimed) return;
 
-  const { phone, body, msgId, chatId } = doc.data() || {};
+  const { phone, body, msgId, chatId } = initialData;
   try {
     await processJob(phone, body, msgId, chatId || null);
     await ref.set({ status: "done", doneAt: new Date() }, { merge: true });
