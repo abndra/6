@@ -163,11 +163,16 @@ async function validateSupabaseConnection() {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 8000);
     try {
-      const res = await fetchImpl(`${url.value}/rest/v1/`, {
+      // نستخدم مسار جدول حقيقي بدلاً من /rest/v1/ لأن الأخير يقبل فقط
+      // secret keys ويعيد 401 حتى مع مفتاح publishable صحيح.
+      // مع publishable key: 200 (RLS تعيد صفوفاً محدودة/فارغة) = مفتاح سليم.
+      // مع مفتاح خاطئ: 401 مع رسالة "Invalid API key".
+      const res = await fetchImpl(`${url.value}/rest/v1/documents?select=path&limit=1`, {
         signal: controller.signal,
         headers: { apikey: candidate.value, Accept: "application/json" },
       });
-      if (res.ok) {
+      // 200 = تمام. 401 = مفتاح خاطئ. 403/404 = مفتاح سليم لكن صلاحية RLS/جدول = نعتبره سليماً.
+      if (res.ok || res.status === 403 || res.status === 404 || res.status === 406) {
         process.env.__TAYSIR_SELECTED_SUPABASE_URL = url.value;
         process.env.__TAYSIR_SELECTED_SUPABASE_URL_NAME = url.name;
         process.env.__TAYSIR_SELECTED_SUPABASE_KEY = candidate.value;
