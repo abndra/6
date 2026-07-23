@@ -49,6 +49,7 @@ const NEW_MESSAGE_GRACE_SEC = Number(process.env.NEW_MESSAGE_GRACE_SEC || 45);
 // هذه ثلاث قيم تُقرأ مرة واحدة عند الإقلاع (تتطلب إعادة نشر لتغييرها):
 const REMOTE_SESSION_BACKUP_MS = Math.max(60000, Number(process.env.REMOTE_SESSION_BACKUP_MS || getPerf("REMOTE_SESSION_BACKUP_MS")));
 const REMOTE_SESSION_CLIENT_ID = String(process.env.REMOTE_SESSION_CLIENT_ID || `${STORE_ID}_${BOT_ID}`).replace(/[^a-z0-9_-]/gi, "_");
+const FIRST_REMOTE_SESSION_SAVE_MS = Math.max(20000, Number(process.env.FIRST_REMOTE_SESSION_SAVE_MS || 30000));
 const MESSAGE_SWEEP_ENABLED = getPerf("MESSAGE_SWEEP_ENABLED");
 const MESSAGE_SWEEP_INTERVAL_MS = Math.max(300000, Number(process.env.MESSAGE_SWEEP_INTERVAL_MS || 600000));
 const MESSAGE_SWEEP_LIMIT = Math.max(3, Math.min(10, Number(process.env.MESSAGE_SWEEP_LIMIT || 5)));
@@ -65,6 +66,33 @@ const TAYSIR_USER_AGENT =
   process.env.TAYSIR_USER_AGENT ||
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
+const chromiumArgs = [
+  "--no-sandbox",
+  "--disable-setuid-sandbox",
+  "--disable-dev-shm-usage",
+  "--disable-gpu",
+  "--disable-extensions",
+  "--no-first-run",
+  "--no-default-browser-check",
+  "--disable-background-timer-throttling",
+  "--disable-backgrounding-occluded-windows",
+  "--disable-renderer-backgrounding",
+  "--disable-sync",
+  "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints,InterestFeedContentSuggestions,CalculateNativeWinOcclusion",
+  "--disable-component-update",
+  "--disable-domain-reliability",
+  "--disable-client-side-phishing-detection",
+  "--metrics-recording-only",
+  "--mute-audio",
+  "--renderer-process-limit=2",
+  `--user-agent=${TAYSIR_USER_AGENT}`,
+  "--js-flags=--max-old-space-size=192",
+];
+
+if (process.env.CHROMIUM_EXTRA_ARGS) {
+  chromiumArgs.push(...process.env.CHROMIUM_EXTRA_ARGS.split(/\s+/).map((arg) => arg.trim()).filter(Boolean));
+}
+
 const client = new Client({
   authStrategy: new RemoteAuth({
     clientId: REMOTE_SESSION_CLIENT_ID,
@@ -73,36 +101,21 @@ const client = new Client({
     backupSyncIntervalMs: REMOTE_SESSION_BACKUP_MS,
   }),
   userAgent: TAYSIR_USER_AGENT,
-  // حل جذري لمشكلة «تسجيل خروج فور مسح QR»: إذا كانت هناك جلسة سابقة/متعارضة على
-  // نفس الرقم، نأخذ الأولوية بدل أن يطردنا واتساب. takeoverTimeoutMs=0 يعني فوراً.
-  takeoverOnConflict: true,
-  takeoverTimeoutMs: 0,
+  // لا نأخذ الجلسة بالقوة أثناء أول ربط. في بعض حسابات واتساب كان takeover الفوري
+  // يجعل الهاتف يعرض الجهاز ثانية واحدة ثم يعتبره خرج بسبب تعارض جلسة قديمة/جديدة.
+  takeoverOnConflict: false,
+  takeoverTimeoutMs: 10000,
   puppeteer: {
     headless: true,
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--disable-extensions",
-      "--no-first-run",
-      "--disable-background-timer-throttling",
-      "--disable-backgrounding-occluded-windows",
-      "--disable-renderer-backgrounding",
-      "--disable-background-networking",
-      "--disable-sync",
-      "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints",
-      "--renderer-process-limit=1",
-      `--user-agent=${TAYSIR_USER_AGENT}`,
-      "--js-flags=--max-old-space-size=96",
-    ],
+    defaultViewport: null,
+    args: chromiumArgs,
   },
 });
 
-// نُعدّل navigator.platform إلى اسم البراند قبل أن تُحمّل صفحة WhatsApp Web،
-// لأن قائمة «الأجهزة المرتبطة» تعرض هذه القيمة كاسم النظام.
-async function applyTaysirBranding(page) {
+// نُعدّل navigator.platform مبكراً قبل أن تُحمّل صفحة WhatsApp Web،
+// لأن قائمة «الأجهزة المرتبطة» تعرض هذه القيمة كاسم النظام. لا نلمس بيانات الجلسة.
+async function prepareWhatsAppPage(page) {
   if (!page) return;
   try {
     await page.setUserAgent(TAYSIR_USER_AGENT);
@@ -126,17 +139,24 @@ async function applyTaysirBranding(page) {
   } catch (_) {}
 }
 
-// نلتقط الصفحة فور إنشائها (قبل initialize يفتح WhatsApp Web) عبر hook داخلي.
+// نلتقط الصفحة فور إنشاء المتصفح وقبل فتح WhatsApp Web.
 const _originalInitialize = client.initialize.bind(client);
 client.initialize = async function () {
-  const result = await _originalInitialize();
-  await applyTaysirBranding(client.pupPage);
-  return result;
+  const originalAfterBrowserInitialized = client.authStrategy.afterBrowserInitialized?.bind(client.authStrategy);
+  if (originalAfterBrowserInitialized && !client.authStrategy.__taysirPagePrepareInstalled) {
+    client.authStrategy.afterBrowserInitialized = async (...args) => {
+      const out = await originalAfterBrowserInitialized(...args);
+      await prepareWhatsAppPage(client.pupPage);
+      return out;
+    };
+    client.authStrategy.__taysirPagePrepareInstalled = true;
+  }
+  return _originalInitialize();
 };
 
 // طبقة أمان إضافية عند ready.
 client.on("ready", async () => {
-  await applyTaysirBranding(client.pupPage);
+  await prepareWhatsAppPage(client.pupPage);
 });
 
 let latestQrRaw = null;
@@ -333,8 +353,11 @@ client.on("ready", async () => {
     waState: lastWaState,
   });
 
-  // RemoteAuth يحفظ أول نسخة مستقرة بعد دقيقة ثم دورياً. الحفظ المبكر المتكرر كان
-  // يتداخل مع الحفظ الداخلي ويولد ENOENT لملف RemoteAuth zip، لذلك نتركه مقفلاً ومتسلسلاً.
+  // نحفظ نسخة أولى بعد استقرار الربط بقليل. إذا أُعيد نشر Railway قبل أول دورة RemoteAuth
+  // فلن تضيع الجلسة ولن يظهر QR جديد بلا سبب.
+  setTimeout(() => {
+    saveRemoteSessionNow().catch((error) => console.warn("first remote session save skipped:", errorMessage(error)));
+  }, FIRST_REMOTE_SESSION_SAVE_MS).unref?.();
 });
 
 client.on("remote_session_saved", async () => {

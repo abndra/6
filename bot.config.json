@@ -3,8 +3,8 @@
   "storeId": "ijErPtzCrAksQpnPSqWI",
   "botId": "ck4y0b3GIXqWlJRtNi06",
   "database": "supabase-documents",
-  "filesVersion": "4.6.1",
-  "filesVersionNote": "إصلاح فحص Supabase: كان يطلب secret key ويرفض publishable key الصحيح مما يمنع البوت من الرد. الآن يفحص جدولاً حقيقياً.",
+  "filesVersion": "4.6.2",
+  "filesVersionNote": "إصلاح ثبات ربط واتساب: إيقاف takeover الفوري، تهيئة Chromium قبل فتح واتساب، زيادة ذاكرة Node، وحفظ أول جلسة بعد استقرار الربط.",
   "architecture": "whatsapp-bridge + supabase documents aiQueue/outbox + groq ai-worker + supabase remote session",
   "messages": "الرسائل الجديدة فقط بعد الربط — لا استيراد للمحادثات القديمة",
   "endpoints": [
@@ -30,6 +30,7 @@
     "GROQ_MODEL",
     "NEW_MESSAGE_GRACE_SEC",
     "REMOTE_SESSION_BACKUP_MS",
+    "FIRST_REMOTE_SESSION_SAVE_MS",
     "AI_POLL_INTERVAL_MS",
     "AI_RECOVER_INTERVAL_MS",
     "AI_GROQ_TIMEOUT_MS",
