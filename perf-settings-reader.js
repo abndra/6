@@ -7,24 +7,26 @@ const { readSupabaseConfig, cleanEnvValue } = require("./env");
 
 const { url: SUPABASE_URL, key: SUPABASE_KEY } = readSupabaseConfig();
 
+// نمط فوري ثابت: كل الفواصل الزمنية مضبوطة على أسرع قيمة عملية
+// حتى تنعكس التغييرات في لوحة تحكم كل متجر مباشرةً بلا تأخير.
 const DEFAULTS = {
-  AI_POLL_INTERVAL_MS: 800,
-  OUTBOX_POLL_INTERVAL_MS: 500,
-  SNAPSHOT_POLL_INTERVAL_MS: 1000,
-  SNAPSHOT_LISTENERS_ENABLED: false,
-  AI_HEARTBEAT_WRITE_MS: 120000,
-  OUTBOX_HEARTBEAT_WRITE_MS: 120000,
-  CONNECTION_VERIFY_INTERVAL_MS: 60000,
-  SUPABASE_CONFIG_CACHE_MS: 10000,
+  AI_POLL_INTERVAL_MS: 100,
+  OUTBOX_POLL_INTERVAL_MS: 100,
+  SNAPSHOT_POLL_INTERVAL_MS: 500,
+  SNAPSHOT_LISTENERS_ENABLED: true,
+  AI_HEARTBEAT_WRITE_MS: 60000,
+  OUTBOX_HEARTBEAT_WRITE_MS: 60000,
+  CONNECTION_VERIFY_INTERVAL_MS: 30000,
+  SUPABASE_CONFIG_CACHE_MS: 500,
   MESSAGE_SWEEP_ENABLED: false,
   REMOTE_SESSION_BACKUP_MS: 300000,
   EVENT_LOG_ENABLED: false,
-  AI_CONFIG_REFRESH_MS: 10000,
+  AI_CONFIG_REFRESH_MS: 3000,
 };
 
 let cached = { ...DEFAULTS };
 let lastFetchAt = 0;
-const REFRESH_MS = 60000; // نحدّث القيم كل دقيقة على الأكثر
+const REFRESH_MS = 5000; // نحدّث القيم من Supabase كل 5 ثوانٍ لتطبيق تغييرات الإعدادات بسرعة.
 
 async function refresh() {
   if (!SUPABASE_URL || !SUPABASE_KEY) return cached;

@@ -48,19 +48,20 @@ const AI_HISTORY_LIMIT = Math.max(6, Math.min(20, Number(process.env.AI_HISTORY_
 const AI_PROMPT_KNOWLEDGE_LIMIT = Math.max(0, Math.min(8, Number(process.env.AI_PROMPT_KNOWLEDGE_LIMIT || 3)));
 const AI_PROMPT_PRODUCT_LIMIT = Math.max(0, Math.min(30, Number(process.env.AI_PROMPT_PRODUCT_LIMIT || 12)));
 const AI_PROMPT_TEXT_LIMIT = Math.max(80, Number(process.env.AI_PROMPT_TEXT_LIMIT || 600));
-const AI_RESPONSE_CACHE_MS = Math.max(0, Number(process.env.AI_RESPONSE_CACHE_MS || 0));
+// كاش الردود مُعطّل دائماً: نريد أن تنعكس تغييرات الإعدادات فوراً بلا كاش وسيط.
+const AI_RESPONSE_CACHE_MS = 0;
 const AI_MAX_MESSAGE_CHARS = Math.max(200, Number(process.env.AI_MAX_MESSAGE_CHARS || 1200));
 const WORKER_STARTED_AT_MS = Date.now();
 const AI_QUEUE_ACCEPT_AFTER_MS = WORKER_STARTED_AT_MS - Math.max(0, Number(process.env.AI_QUEUE_STARTUP_GRACE_MS || 15000));
-const AI_BURST_WAIT_MS = Math.max(0, Math.min(1200, Number(process.env.AI_BURST_WAIT_MS || 0)));
+// لا تأخير burst — نعالج كل رسالة فور وصولها للردّ الفوري.
+const AI_BURST_WAIT_MS = 0;
 const FAST_QUEUE_MODE = String(process.env.FAST_QUEUE_MODE || "true").toLowerCase() !== "false";
 
 const responseCache = new Map();
 
-function queueDelay(key, fallback) {
-  const configured = Number(getPerf(key, fallback)) || fallback;
-  if (!FAST_QUEUE_MODE) return Math.max(3000, configured);
-  return Math.max(250, Math.min(configured, fallback));
+function queueDelay(_key, _fallback) {
+  // نمط فوري ثابت: نستطلع الطابور كل 100ms — استهلاك أعلى مقابل ردّ فوري.
+  return 100;
 }
 
 // ============================================================
@@ -316,18 +317,20 @@ let configLoaded = false;
 let configReadyPromise = refreshConfigFromSupabase("startup").finally(() => { configLoaded = true; });
 
 function refreshConfigForMessageInBackground() {
-  const minGap = Math.max(3000, Math.min(15000, Number(getPerf("AI_CONFIG_REFRESH_MS")) || 10000));
+  // نحدّث الإعدادات مع كل رسالة تقريباً (بحد أدنى 500ms بين الطلبات) لتنعكس
+  // تغييرات لوحة المتجر فوراً بلا انتظار.
+  const minGap = 500;
   if (messageConfigRefreshInFlight || Date.now() - lastConfigRefreshAt < minGap) return;
   messageConfigRefreshInFlight = refreshConfigFromSupabase("message-background")
     .catch(() => {})
     .finally(() => { messageConfigRefreshInFlight = null; });
 }
 function scheduleConfigRefresh() {
-  const delay = Math.max(60000, getPerf("AI_CONFIG_REFRESH_MS"));
+  // تحديث دوري كل 5 ثوانٍ من Supabase لضمان مزامنة الإعدادات باستمرار.
   setTimeout(() => {
     refreshConfigFromSupabase("interval").catch(() => {});
     scheduleConfigRefresh();
-  }, delay).unref?.();
+  }, 5000).unref?.();
 }
 scheduleConfigRefresh();
 
@@ -491,11 +494,8 @@ function instantMatch(text) {
     return formatProductsList();
   }
 
-  if (/^(السلام\s+عليكم|مرحبا|مراحب|هلا|اهلا|أهلا|هاي|كيفك|كيف\s+الحال|شلونك|صباح\s+الخير|مساء\s+الخير)/i.test(t)) {
-    return t.includes("السلام")
-      ? `وعليكم السلام ورحمة الله وبركاته، أهلاً بك في ${botConfig.storeName || "المتجر"}. كيف أقدر أساعدك؟`
-      : `أهلاً بك في ${botConfig.storeName || "المتجر"}. كيف أقدر أساعدك؟`;
-  }
+  // ملاحظة: الترحيب/المحادثة العامة تُترك للذكاء الاصطناعي ليكون الرد طبيعياً وذكياً
+  // بدل رد قالبي متكرر ("أهلاً بك في NURA. كيف أقدر أساعدك؟").
 
   const imageIntent = /(صوره|صورة|صور|اشوف|شوف|ارسل|اعرض)/i.test(t);
   if (imageIntent) {
