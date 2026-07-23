@@ -11,15 +11,21 @@
 
 const { createClient } = require("@supabase/supabase-js");
 const WebSocket = require("ws");
-const { readSupabaseConfig, createSupabaseFetch, looksLikeSupabaseKey } = require("./env");
 
-const { url: SUPABASE_URL, key: SUPABASE_KEY, keyName: SUPABASE_KEY_NAME } = readSupabaseConfig();
+const SUPABASE_URL =
+  process.env.APP_BACKEND_URL ||
+  process.env.APP_SUPABASE_URL ||
+  process.env.SUPABASE_URL;
+const SUPABASE_KEY =
+  process.env.APP_BACKEND_PUBLISHABLE_KEY ||
+  process.env.APP_SUPABASE_PUBLISHABLE_KEY ||
+  process.env.SUPABASE_PUBLISHABLE_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  process.env.APP_SUPABASE_SECRET_KEY ||
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_SECRET_KEY;
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "";
-// ملاحظة مهمة: هذه الطبقة لا تستخدم Realtime حقيقي؛ onSnapshot هنا كان polling كل 500ms.
-// هذا سبّب استهلاك egress عالي جداً على Railway/Supabase حتى بدون رسائل.
-// لذلك نعطّله افتراضياً ونترك المعالجة لفواصل AI/OUTBOX الخفيفة أدناه.
-const SNAPSHOT_LISTENERS_ENABLED = String(process.env.SNAPSHOT_LISTENERS_ENABLED || "false").toLowerCase() === "true";
-const SNAPSHOT_POLL_INTERVAL_MS = Math.max(15000, Number(process.env.SNAPSHOT_POLL_INTERVAL_MS || 60000));
+const SNAPSHOT_POLL_INTERVAL_MS = Math.max(150, Number(process.env.SNAPSHOT_POLL_INTERVAL_MS || 500));
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   throw new Error(
@@ -27,18 +33,27 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
   );
 }
 
-if (!looksLikeSupabaseKey(SUPABASE_KEY)) {
-  throw new Error(
-    `${SUPABASE_KEY_NAME || "Supabase key"} invalid format. ضع قيمة المفتاح فقط مثل sb_publishable_... وليس السطر كاملاً KEY=value.`,
-  );
+if (!SERVICE_TOKEN) {
+  throw new Error("SERVICE_TOKEN missing: ضعه في Railway بنفس القيمة المحفوظة داخل إعدادات البوت");
 }
 
-if (!SERVICE_TOKEN) {
-  console.error("SERVICE_TOKEN missing: ضعه في Railway بنفس القيمة المحفوظة داخل إعدادات البوت");
+function makeFetch(key) {
+  return (input, init) => {
+    const headers = new Headers((init && init.headers) || undefined);
+    if (
+      (key.startsWith("sb_publishable_") || key.startsWith("sb_secret_")) &&
+      headers.get("Authorization") === `Bearer ${key}`
+    ) {
+      headers.delete("Authorization");
+    }
+    headers.set("apikey", key);
+    headers.set("x-service-token", SERVICE_TOKEN);
+    return fetch(input, { ...init, headers });
+  };
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
-  global: { fetch: createSupabaseFetch(SUPABASE_KEY) },
+  global: { fetch: makeFetch(SUPABASE_KEY) },
   auth: { persistSession: false, autoRefreshToken: false },
   // Railway may run on Node versions without a built-in WebSocket implementation.
   // Passing an explicit transport prevents Supabase Realtime from crashing before
@@ -262,10 +277,6 @@ function collRef(path, cgroup) {
       return rows.map((r) => docRef(r.path));
     },
     onSnapshot(onNext, onError) {
-      if (!SNAPSHOT_LISTENERS_ENABLED) {
-        // لا polling خفي افتراضياً. الدوال الدورية في ai-worker/server هي المسؤولة عن السحب.
-        return () => {};
-      }
       let stopped = false;
       let last = new Map(); // path -> JSON hash
       const tick = async () => {

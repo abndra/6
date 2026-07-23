@@ -14,8 +14,6 @@
 // ---- تهيئة طبقة التوافق (Supabase تحت الغطاء) ----
 const { admin, getFirestore, FieldValue } = require("./firestore-compat");
 const crypto = require("crypto");
-const { getPerf } = require("./perf-settings-reader");
-const runtimeBus = require("./runtime-bus");
 
 if (!admin.apps.length) admin.initializeApp();
 
@@ -47,10 +45,11 @@ const botRef = () => storeRef().collection("bots").doc(BOT_ID);
 const botSecretsRef = () => db.collection("stores").doc(STORE_ID).collection("botSecrets").doc(BOT_ID);
 const now = () => FieldValue.serverTimestamp();
 
-// تقليل استهلاك قاعدة البيانات: EVENT_LOG_ENABLED والكاش تُقرأ ديناميكياً من perfSettings.
-function isEventLogEnabled() { return getPerf("EVENT_LOG_ENABLED"); }
-function configCacheMs() { return Math.max(0, getPerf("SUPABASE_CONFIG_CACHE_MS")); }
-const CONNECTION_STATE_MIN_WRITE_MS = Math.max(1000, Number(process.env.CONNECTION_STATE_MIN_WRITE_MS || 30000));
+// تقليل استهلاك قاعدة البيانات: لا نسجل أحداثاً تفصيلية إلا عند تفعيلها صراحة،
+// ونحتفظ بإعدادات البوت في الذاكرة حتى لا ينهار الرد عند ضغط/انقطاع مؤقت في الكوتا.
+const EVENT_LOG_ENABLED = String(process.env.EVENT_LOG_ENABLED || "false").toLowerCase() === "true";
+const CONFIG_CACHE_MS = Math.max(0, Number(process.env.SUPABASE_CONFIG_CACHE_MS || process.env.FIRESTORE_CONFIG_CACHE_MS || 1000));
+const CONNECTION_STATE_MIN_WRITE_MS = Math.max(1000, Number(process.env.CONNECTION_STATE_MIN_WRITE_MS || 5000));
 let botSecretsCache = { data: null, expiresAt: 0, lastErrorLogAt: 0 };
 let storeConfigCache = { data: null, expiresAt: 0, lastErrorLogAt: 0 };
 let lastConnectionStateWriteAt = 0;
@@ -72,13 +71,13 @@ async function readCachedDoc(ref, cache, label) {
   try {
     const snap = await ref.get();
     cache.data = snap.exists ? snap.data() : {};
-    cache.expiresAt = t + configCacheMs();
+    cache.expiresAt = t + CONFIG_CACHE_MS;
     return cache.data;
   } catch (e) {
     logReadFailure(cache, label, e);
     if (cache.data) {
       // عند ضغط قاعدة البيانات نستمر بآخر إعداد معروف بدلاً من إسقاط Groq/المعرفة إلى قيم فارغة.
-      cache.expiresAt = t + (isQuotaError(e) ? configCacheMs() : 30_000);
+      cache.expiresAt = t + (isQuotaError(e) ? CONFIG_CACHE_MS : 30_000);
       return cache.data;
     }
     return {};
@@ -89,7 +88,7 @@ async function readFreshDoc(ref, cache, label, options = {}) {
   try {
     const snap = await ref.get();
     cache.data = snap.exists ? snap.data() : {};
-    cache.expiresAt = Date.now() + configCacheMs();
+    cache.expiresAt = Date.now() + CONFIG_CACHE_MS;
     return cache.data;
   } catch (e) {
     logReadFailure(cache, label, e);
@@ -203,8 +202,6 @@ async function saveIncomingMessage(msg) {
     throw e;
   }
 
-  const aiQueueRef = botRef().collection("aiQueue").doc(messageDocId);
-
   await Promise.all([
     convRef.set(
       {
@@ -227,7 +224,7 @@ async function saveIncomingMessage(msg) {
       timestamp: now(),
     }),
     botRef().set({ messagesCount: FieldValue.increment(1), lastMessageAt: now() }, { merge: true }),
-    aiQueueRef.set({
+    botRef().collection("aiQueue").doc(messageDocId).set({
       phone,
       chatId,
       name,
@@ -237,8 +234,6 @@ async function saveIncomingMessage(msg) {
       createdAt: now(),
     }),
   ]);
-
-  runtimeBus.emit("aiQueuePending", messageDocId);
 
   // سجّل قيداً في سجل استهلاك التوكن — قراءة رسالة عميل
   appendTokenLedger({
@@ -306,7 +301,6 @@ async function queueAiReply(phone, text, { source = "ai", chatId = null } = {}) 
 
 async function queueOutgoingMessage(phone, text, { source = "api", chatId = null } = {}) {
   const convRef = botRef().collection("conversations").doc(phone);
-  const outboxRef = botRef().collection("outbox").doc();
 
   // 4.a) الرسالة الصادرة داخل المحادثة (تظهر فوراً في اللوحة)
   const msgDoc = await convRef.collection("messages").add({
@@ -323,7 +317,7 @@ async function queueOutgoingMessage(phone, text, { source = "api", chatId = null
   await Promise.all([
     convRef.set({ lastMessage: text, updatedAt: now(), ...(chatId ? { chatId } : {}) }, { merge: true }),
     // 4.b) طابور الإرسال — خادم واتساب يستمع لهذه المجموعة ويرسل فوراً
-    outboxRef.set({
+    botRef().collection("outbox").add({
       phone,
       chatId,
       text,
@@ -333,8 +327,6 @@ async function queueOutgoingMessage(phone, text, { source = "api", chatId = null
       source,
     }),
   ]);
-
-  runtimeBus.emit("outboxPending", outboxRef.id);
 
   // سجّل قيد استهلاك — إرسال رد
   appendTokenLedger({
@@ -354,9 +346,7 @@ async function queueOutgoingMessage(phone, text, { source = "api", chatId = null
 // سجل استهلاك التوكن — يُكتب في مجموعة فرعية للبوت
 // يستخدمه لوحة الأدمين لعرض تفاصيل كل عملية استهلاك
 // ============================================================
-const TOKEN_LEDGER_ENABLED = String(process.env.TOKEN_LEDGER_ENABLED || "false").toLowerCase() === "true";
 async function appendTokenLedger(entry = {}) {
-  if (!TOKEN_LEDGER_ENABLED) return; // معطل افتراضياً لتقليل استهلاك Supabase egress
   try {
     const doc = {
       at: now(),
@@ -370,6 +360,8 @@ async function appendTokenLedger(entry = {}) {
       source: entry.source ? String(entry.source) : null,
     };
     await botRef().collection("tokenLedger").add(doc);
+    // trim: احتفظ بآخر ~500 قيد فقط لتجنّب تضخّم الجدول.
+    // نعتمد على تنظيف دوري خارج هذه الدالة إن لزم.
   } catch (e) {
     console.error("appendTokenLedger:", e.message);
   }
@@ -398,7 +390,7 @@ async function markOutboxError(outboxId, message) {
 // 6) سجل الأحداث
 // ============================================================
 async function logEvent(type, payload = {}) {
-  if (!isEventLogEnabled()) return;
+  if (!EVENT_LOG_ENABLED) return;
   try {
     await botRef().collection("events").add({ type, payload, at: now() });
   } catch (e) {

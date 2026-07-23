@@ -34,35 +34,27 @@ const {
   markPoolGroqActive,
   runPoolGroqAutoRenewal,
 } = require("./firestore-writer");
-const { getPerf } = require("./perf-settings-reader");
-const runtimeBus = require("./runtime-bus");
 
+// نموذج أذكى بكثير من 8b — يفهم السياق واللهجات بدقة عالية جداً
 const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 const STALE_PROCESSING_MS = Number(process.env.AI_STALE_PROCESSING_MS || 120000);
-const AI_RECOVER_INTERVAL_MS = Math.max(60000, Number(process.env.AI_RECOVER_INTERVAL_MS || 300000));
-const AI_GROQ_TIMEOUT_MS = Math.max(4000, Number(process.env.AI_GROQ_TIMEOUT_MS || 9000));
-const AI_MAX_CONCURRENT = Math.max(1, Math.min(3, Number(process.env.AI_MAX_CONCURRENT || 2)));
+// السرعة أولاً: onSnapshot يلتقط الرسالة فوراً، polling كشبكة أمان بأدنى تأخير
+const AI_POLL_INTERVAL_MS = Math.max(500, Number(process.env.AI_POLL_INTERVAL_MS || 1000));
+const AI_RECOVER_INTERVAL_MS = Math.max(15000, Number(process.env.AI_RECOVER_INTERVAL_MS || 30000));
+const AI_GROQ_TIMEOUT_MS = Math.max(4000, Number(process.env.AI_GROQ_TIMEOUT_MS || 15000));
+const AI_MAX_CONCURRENT = Math.max(1, Math.min(3, Number(process.env.AI_MAX_CONCURRENT || 1)));
+const AI_CONFIG_REFRESH_MS = Math.max(30000, Number(process.env.AI_CONFIG_REFRESH_MS || 60000));
+const AI_HEARTBEAT_WRITE_MS = Math.max(5000, Number(process.env.AI_HEARTBEAT_WRITE_MS || 30000));
 const DEFAULT_CLOSED_MESSAGE = "نعتذر، المتجر مغلق حالياً. سنعود إليك عند الفتح.";
 const GROQ_FAST_MODEL = process.env.GROQ_FAST_MODEL || "llama-3.3-70b-versatile";
 const AI_HISTORY_LIMIT = Math.max(6, Math.min(20, Number(process.env.AI_HISTORY_LIMIT || 12)));
 const AI_PROMPT_KNOWLEDGE_LIMIT = Math.max(0, Math.min(8, Number(process.env.AI_PROMPT_KNOWLEDGE_LIMIT || 3)));
 const AI_PROMPT_PRODUCT_LIMIT = Math.max(0, Math.min(30, Number(process.env.AI_PROMPT_PRODUCT_LIMIT || 12)));
 const AI_PROMPT_TEXT_LIMIT = Math.max(80, Number(process.env.AI_PROMPT_TEXT_LIMIT || 600));
-// كاش الردود مُعطّل دائماً: نريد أن تنعكس تغييرات الإعدادات فوراً بلا كاش وسيط.
-const AI_RESPONSE_CACHE_MS = 0;
+const AI_RESPONSE_CACHE_MS = Math.max(0, Number(process.env.AI_RESPONSE_CACHE_MS || 5 * 60 * 1000));
 const AI_MAX_MESSAGE_CHARS = Math.max(200, Number(process.env.AI_MAX_MESSAGE_CHARS || 1200));
-const WORKER_STARTED_AT_MS = Date.now();
-const AI_QUEUE_ACCEPT_AFTER_MS = WORKER_STARTED_AT_MS - Math.max(0, Number(process.env.AI_QUEUE_STARTUP_GRACE_MS || 15000));
-// لا تأخير burst — نعالج كل رسالة فور وصولها للردّ الفوري.
-const AI_BURST_WAIT_MS = 0;
-const FAST_QUEUE_MODE = String(process.env.FAST_QUEUE_MODE || "true").toLowerCase() !== "false";
 
 const responseCache = new Map();
-
-function queueDelay(_key, _fallback) {
-  // نمط فوري ثابت: نستطلع الطابور كل 100ms — استهلاك أعلى مقابل ردّ فوري.
-  return 100;
-}
 
 // ============================================================
 // 🛡️  البرومبت الأساسي الافتراضي لجميع بوتات تيسير (لا يُكشف أبداً)
@@ -130,8 +122,6 @@ let botConfig = {
 };
 let lastAiHeartbeatAt = 0;
 let lastConfigLog = { key: "", at: 0 };
-let lastConfigRefreshAt = 0;
-let messageConfigRefreshInFlight = null;
 
 function asArray(value) {
   return Array.isArray(value) ? value.filter(Boolean) : [];
@@ -305,7 +295,6 @@ async function refreshConfigFromSupabase(reason = "interval") {
   try {
     const botSnap = await botRef().get();
     await refreshConfig(botSnap.exists ? botSnap.data() : {}, { force: reason === "message" || reason === "config-listener" });
-    lastConfigRefreshAt = Date.now();
   } catch (e) {
     console.error(`config refresh failed (${reason}):`, e.message);
     // لا نفرّغ الإعدادات عند نفاد الكوتا؛ نكمل بآخر إعداد محفوظ في الذاكرة.
@@ -313,26 +302,10 @@ async function refreshConfigFromSupabase(reason = "interval") {
 }
 
 // مهم: لا نستخدم مراقبة مباشرة على وثيقة البوت لأنها تتغير مع كل health/status heartbeat.
-let configLoaded = false;
-let configReadyPromise = refreshConfigFromSupabase("startup").finally(() => { configLoaded = true; });
-
-function refreshConfigForMessageInBackground() {
-  // نحدّث الإعدادات مع كل رسالة تقريباً (بحد أدنى 500ms بين الطلبات) لتنعكس
-  // تغييرات لوحة المتجر فوراً بلا انتظار.
-  const minGap = 500;
-  if (messageConfigRefreshInFlight || Date.now() - lastConfigRefreshAt < minGap) return;
-  messageConfigRefreshInFlight = refreshConfigFromSupabase("message-background")
-    .catch(() => {})
-    .finally(() => { messageConfigRefreshInFlight = null; });
-}
-function scheduleConfigRefresh() {
-  // تحديث دوري كل 5 ثوانٍ من Supabase لضمان مزامنة الإعدادات باستمرار.
-  setTimeout(() => {
-    refreshConfigFromSupabase("interval").catch(() => {});
-    scheduleConfigRefresh();
-  }, 5000).unref?.();
-}
-scheduleConfigRefresh();
+refreshConfigFromSupabase("startup").catch(() => {});
+setInterval(() => {
+  refreshConfigFromSupabase("interval").catch(() => {});
+}, AI_CONFIG_REFRESH_MS).unref?.();
 
 // ============================================================
 // مطابقة فورية من إعدادات البوت (بدون Groq)
@@ -450,14 +423,6 @@ function instantMatch(text) {
     return "شكراً على اقتراحك، بسجله للإدارة الآن حتى تتم مراجعته وتحسين الخدمة.";
   }
 
-  if (/(^|\s)(مين|من)\s+(انت|انتي|أنت|أنتي|حضرتك)(\s|$)|عرف\s*نفسك|شو\s+انت/i.test(t)) {
-    return `أنا ${botConfig.botName || "المساعد"}، مساعد ذكي تابع لمتجر ${botConfig.storeName || "المتجر"}. أقدر أساعدك بالمنتجات والأسعار والطلبات.`;
-  }
-
-  if (/(اسم\s*(المتجر|المحل|الشركه|الشركة)|شو\s+اسم\s*(المتجر|المحل)|ايش\s+اسم\s*(المتجر|المحل)|وش\s+اسم\s*(المتجر|المحل))/i.test(t)) {
-    return `اسم المتجر: ${botConfig.storeName || "المتجر"}.`;
-  }
-
   // 🛒 فحص توفّر صارم: عند سؤال العميل "هل عندكم X / في عندكم X / عندكم X؟"
   // نجيب حرفياً من المخزون، ولا نترك النموذج يخترع فئات غير موجودة.
   const availabilityMatch = t.match(
@@ -489,13 +454,6 @@ function instantMatch(text) {
     });
     return `نعم متوفر:\n${lines.join("\n")}\nأي واحد تحب؟`;
   }
-
-  if (/(شو|ايش|وش|ماذا|ما)\s*(بتبيع|تبيع|عندكم|متوفر|متوفرين)|\b(منتجات|منتجاتكم|المنتجات|منيو|المنيو|قائمه|قائمة|اسعار|الاسعار|أسعار|الأسعار)\b|كم\s*(السعر|الاسعار|الأسعار)/i.test(t)) {
-    return formatProductsList();
-  }
-
-  // ملاحظة: الترحيب/المحادثة العامة تُترك للذكاء الاصطناعي ليكون الرد طبيعياً وذكياً
-  // بدل رد قالبي متكرر ("أهلاً بك في NURA. كيف أقدر أساعدك؟").
 
   const imageIntent = /(صوره|صورة|صور|اشوف|شوف|ارسل|اعرض)/i.test(t);
   if (imageIntent) {
@@ -543,21 +501,6 @@ function tokenScore(a, b) {
   return bw.filter((w) => aw.has(w) || [...aw].some((x) => x.includes(w) || w.includes(x))).length / bw.length;
 }
 
-function formatProductLine(p) {
-  const name = textValue(p?.name, p?.title, "منتج");
-  const price = p?.price != null && p.price !== "" ? ` — ${p.price}` : "";
-  const desc = p?.description ? ` — ${clampText(p.description, 90)}` : "";
-  return `• ${name}${price}${desc}`;
-}
-
-function formatProductsList(limit = 12) {
-  const products = asArray(botConfig.products).filter((p) => textValue(p?.name, p?.title));
-  if (!products.length) return "حالياً لا توجد منتجات مضافة في لوحة المتجر.";
-  const lines = products.slice(0, limit).map(formatProductLine);
-  const more = products.length > limit ? `\nويوجد ${products.length - limit} منتج آخر — اسألني عن اسم المنتج لأعطيك سعره وتفاصيله.` : "";
-  return `المتوفر حالياً في ${botConfig.storeName || "المتجر"}:\n${lines.join("\n")}${more}`;
-}
-
 function clampText(value, limit = AI_PROMPT_TEXT_LIMIT) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (!text || text.length <= limit) return text;
@@ -603,7 +546,9 @@ function fallbackReplyFor(userMessage) {
   }).filter(Boolean);
 
   if (/(شو|ايش|وش|ماذا|ما)\s*(عندكم|متوفر|متوفرين)|منتجات|المنيو|منيو|اسعار|أسعار|قائمة/i.test(text)) {
-    return formatProductsList();
+    return productLines.length
+      ? `المتوفر حالياً:\n${productLines.join("\n")}`
+      : "لم يتم إضافة منتجات في المخزون حالياً، تواصل معنا بعد قليل.";
   }
 
   const matchedProduct = products.find((p) => {
@@ -1184,21 +1129,6 @@ function makeDedupKey(...parts) {
   return parts.map((p) => String(p || "").trim().toLowerCase()).filter(Boolean).join("|").slice(0, 200);
 }
 
-function timestampToMs(value) {
-  if (!value) return 0;
-  if (typeof value?.toMillis === "function") return value.toMillis();
-  if (typeof value?.seconds === "number") return value.seconds * 1000;
-  if (value instanceof Date) return value.getTime();
-  if (typeof value === "number") return value;
-  if (typeof value === "string") return Date.parse(value) || 0;
-  return 0;
-}
-
-function isOlderThanWorkerStart(value) {
-  const ms = timestampToMs(value);
-  return !!ms && ms < AI_QUEUE_ACCEPT_AFTER_MS;
-}
-
 async function extractAndLogOrder(phone, userText, botText, history = []) {
   const keys = Array.isArray(botConfig.groqApiKeys) ? botConfig.groqApiKeys.filter((k) => k && k.key && !k.disabled) : [];
   if (!keys.length) return;
@@ -1493,13 +1423,12 @@ async function extractAndApplyOrderChange(phone, userText, botText, history = []
 // ============================================================
 
 async function processJob(phone, body, msgId, chatId = null) {
-  // لا نوقف الرد بانتظار قراءة الإعدادات كل رسالة؛ نستخدم آخر تدريب محفوظ في الذاكرة
-  // ونحدّثه بالخلفية. عند أول تشغيل فقط ننتظر أول تحميل حتى لا يرد البوت بدون تدريب.
-  if (configLoaded) refreshConfigForMessageInBackground();
+  // إطلاق تحديث الإعدادات وتحميل السياق بالتوازي منذ اللحظة الأولى — أقصى سرعة ممكنة
+  const configPromise = refreshConfigFromSupabase("message").catch(() => {});
   const historyPromise = loadHistory(phone).catch(() => []);
   const text = (body || "").trim();
   if (!text) return;
-  if (!configLoaded) await configReadyPromise.catch(() => {});
+  await configPromise;
 
   // 1) المتجر/البوت مغلق أو خارج ساعات العمل — أعلى أولوية دائماً ولا يتجاوزها أي ذكاء/تحويل.
   // 0) الوكيل موقوف يدوياً من زر ON/OFF في لوحة التحكم — تجاهل الرسالة بصمت
@@ -1584,6 +1513,10 @@ async function processJob(phone, body, msgId, chatId = null) {
   } catch (e) {
     console.error("Groq failed:", e.message);
     await logEvent("groq_error", { phone, message: e.message });
+    if (/GROQ_API_KEY missing/i.test(String(e.message || ""))) {
+      await markIncomingAiError(phone, msgId, e.message);
+      return;
+    }
     const fallback = fallbackReplyFor(text);
     if (shouldSendFallbackNow(phone)) {
       await queueAiReply(phone, fallback, { source: /429|rate/i.test(String(e.message || "")) ? "rate-limit-fallback" : "fallback", chatId });
@@ -1602,10 +1535,8 @@ async function processJob(phone, body, msgId, chatId = null) {
 // الاستماع لطابور الذكاء — onSnapshot للسرعة + polling دائم كشبكة أمان
 // ============================================================
 const processing = new Set();
-const processingPhones = new Set();
 let unsubscribeAiQueue = null;
 let aiListenerRetryTimer = null;
-let aiListenerRetryDelayMs = 30000;
 let drainingQueue = false;
 
 function canStartMoreJobs() {
@@ -1614,31 +1545,12 @@ function canStartMoreJobs() {
 
 function startQueueDoc(doc) {
   if (!doc?.id || processing.has(doc.id) || !canStartMoreJobs()) return false;
-  const phone = String(doc.data()?.phone || "").trim();
-  if (phone && processingPhones.has(phone)) return false;
   processing.add(doc.id);
-  if (phone) processingPhones.add(phone);
-  handleQueueDoc(doc).finally(() => {
-    processing.delete(doc.id);
-    if (phone) processingPhones.delete(phone);
-  });
+  handleQueueDoc(doc).finally(() => processing.delete(doc.id));
   return true;
 }
 
-runtimeBus.on("aiQueuePending", (id) => {
-  if (!id) return;
-  setTimeout(async () => {
-    try {
-      const doc = await botRef().collection("aiQueue").doc(id).get();
-      if (doc?.exists) startQueueDoc(doc);
-    } catch (e) {
-      console.error("ai immediate signal failed:", e.message);
-    }
-  }, 0).unref?.();
-});
-
 function attachAiQueueListener() {
-  if (String(process.env.SNAPSHOT_LISTENERS_ENABLED || "false").toLowerCase() !== "true") return;
   try {
     if (typeof unsubscribeAiQueue === "function") unsubscribeAiQueue();
   } catch {}
@@ -1654,12 +1566,9 @@ function attachAiQueueListener() {
       },
       (err) => {
         console.error("aiQueue listener error:", err.message);
-        if (!/restricted|egress|quota/i.test(String(err.message || ""))) {
-          logEvent("ai_listener_error", { message: err.message }).catch(() => {});
-        }
+        logEvent("ai_listener_error", { message: err.message }).catch(() => {});
         clearTimeout(aiListenerRetryTimer);
-        aiListenerRetryTimer = setTimeout(attachAiQueueListener, aiListenerRetryDelayMs);
-        aiListenerRetryDelayMs = Math.min(aiListenerRetryDelayMs * 2, 5 * 60 * 1000);
+        aiListenerRetryTimer = setTimeout(attachAiQueueListener, 5000);
         aiListenerRetryTimer.unref?.();
       },
     );
@@ -1685,7 +1594,7 @@ async function drainPendingJobs(reason = "poll") {
   try {
     await recoverStuckJobs();
     while (canStartMoreJobs()) {
-      const limit = Math.max(10, AI_MAX_CONCURRENT * 5);
+      const limit = Math.max(1, AI_MAX_CONCURRENT - processing.size);
       const pend = await botRef().collection("aiQueue").where("status", "==", "pending").limit(limit).get();
       if (pend.empty) break;
       let started = 0;
@@ -1695,8 +1604,7 @@ async function drainPendingJobs(reason = "poll") {
       if (!started) break;
     }
     const t = Date.now();
-    const hb = Math.max(60000, getPerf("AI_HEARTBEAT_WRITE_MS"));
-    if (t - lastAiHeartbeatAt >= hb) {
+    if (t - lastAiHeartbeatAt >= AI_HEARTBEAT_WRITE_MS) {
       lastAiHeartbeatAt = t;
       await botRef().set(
         {
@@ -1709,12 +1617,8 @@ async function drainPendingJobs(reason = "poll") {
       );
     }
   } catch (e) {
-    if (/restricted|egress|quota/i.test(String(e.message || ""))) {
-      console.error("ai queue paused by platform quota:", e.message);
-    } else {
-      console.error("ai queue drain error:", e.message);
-      await logEvent("ai_queue_drain_error", { message: e.message }).catch(() => {});
-    }
+    console.error("ai queue drain error:", e.message);
+    await logEvent("ai_queue_drain_error", { message: e.message }).catch(() => {});
   } finally {
     drainingQueue = false;
   }
@@ -1722,23 +1626,13 @@ async function drainPendingJobs(reason = "poll") {
 
 async function handleQueueDoc(doc) {
   const ref = doc.ref;
-  const initialData = doc.data() || {};
-  if (isOlderThanWorkerStart(initialData.createdAt)) {
-    await ref.set({ status: "skipped", skippedAt: new Date(), skipReason: "old job from previous deployment" }, { merge: true }).catch(() => {});
-    return;
-  }
   // نطالب بالوثيقة عبر transaction لمنع المعالجة المزدوجة
   let claimed = false;
   try {
     await botRef().firestore.runTransaction(async (tx) => {
       const fresh = await tx.get(ref);
       if (!fresh.exists) return;
-      const freshData = fresh.data() || {};
-      if (freshData.status !== "pending") return;
-      if (isOlderThanWorkerStart(freshData.createdAt)) {
-        tx.update(ref, { status: "skipped", skippedAt: FieldValue.serverTimestamp(), skipReason: "old job from previous deployment" });
-        return;
-      }
+      if (fresh.data().status !== "pending") return;
       tx.update(ref, { status: "processing", claimedAt: FieldValue.serverTimestamp() });
       claimed = true;
     });
@@ -1748,60 +1642,22 @@ async function handleQueueDoc(doc) {
   }
   if (!claimed) return;
 
-  const { phone, body, msgId, chatId } = initialData;
-  const burst = await collectPendingBurst(phone, initialData).catch(() => ({ text: body, extras: [] }));
+  const { phone, body, msgId, chatId } = doc.data() || {};
   try {
-    await processJob(phone, burst.text || body, msgId, burst.chatId || chatId || null);
+    await processJob(phone, body, msgId, chatId || null);
     await ref.set({ status: "done", doneAt: new Date() }, { merge: true });
-    await Promise.all((burst.extras || []).map(async (extra) => {
-      await extra.ref.set({ status: "done", doneAt: new Date(), mergedWith: doc.id }, { merge: true }).catch(() => {});
-      if (extra.msgId) await markIncomingAiDone(phone, extra.msgId, { aiResponse: null, aiSource: "merged_with_burst_reply" }).catch(() => {});
-    }));
   } catch (e) {
     console.error("processJob error:", e.message);
     await ref.set({ status: "error", error: String(e.message).slice(0, 300) }, { merge: true }).catch(() => {});
   }
 }
 
-async function collectPendingBurst(phone, currentData = {}) {
-  if (!AI_BURST_WAIT_MS || !phone) return { text: currentData.body || "", extras: [], chatId: currentData.chatId || null };
-  await new Promise((resolve) => setTimeout(resolve, AI_BURST_WAIT_MS).unref?.());
-  const snap = await botRef().collection("aiQueue")
-    .where("status", "==", "pending")
-    .where("phone", "==", phone)
-    .limit(8)
-    .get();
-  const currentMs = timestampToMs(currentData.createdAt) || Date.now();
-  const extras = snap.docs
-    .map((d) => ({ id: d.id, ref: d.ref, data: d.data() || {} }))
-    .filter((x) => x.data.body && !isOlderThanWorkerStart(x.data.createdAt))
-    .filter((x) => {
-      const ms = timestampToMs(x.data.createdAt) || Date.now();
-      return ms >= currentMs - 1000 && ms <= Date.now() + 1000;
-    })
-    .sort((a, b) => (timestampToMs(a.data.createdAt) || 0) - (timestampToMs(b.data.createdAt) || 0))
-    .slice(0, 5);
-  await Promise.all(extras.map((x) => x.ref.set({ status: "processing", claimedAt: FieldValue.serverTimestamp(), mergedWith: currentData.msgId || "burst" }, { merge: true }).catch(() => {})));
-  const bodies = [currentData.body, ...extras.map((x) => x.data.body)].map((x) => String(x || "").trim()).filter(Boolean);
-  if (bodies.length <= 1) return { text: currentData.body || "", extras: [], chatId: currentData.chatId || null };
-  return {
-    text: `رسائل متتالية من نفس العميل، أجب برد واحد يغطيها كلها واعتمد آخر سؤال:\n${bodies.map((b, i) => `${i + 1}) ${b}`).join("\n")}`,
-    extras: extras.map((x) => ({ ref: x.ref, msgId: x.data.msgId, id: x.id })),
-    chatId: extras[extras.length - 1]?.data?.chatId || currentData.chatId || null,
-  };
-}
-
 console.log("🤖 عامل الذكاء (Groq) يعمل ويستمع لطابور الرسائل...");
 attachAiQueueListener();
 
-function scheduleAiPoll() {
-  const delay = queueDelay("AI_POLL_INTERVAL_MS", 800);
-  setTimeout(() => {
-    drainPendingJobs("interval").catch(() => {});
-    scheduleAiPoll();
-  }, delay).unref?.();
-}
-scheduleAiPoll();
+setInterval(() => {
+  drainPendingJobs("interval").catch(() => {});
+}, AI_POLL_INTERVAL_MS).unref?.();
 
 setInterval(() => {
   recoverStuckJobs().catch((e) => console.error("recover stuck jobs error:", e.message));
