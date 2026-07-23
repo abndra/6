@@ -12,7 +12,7 @@
 
 ```env
 APP_BACKEND_URL=https://YOUR-BACKEND-URL
-APP_BACKEND_PUBLISHABLE_KEY=ضع_مفتاح_النشر_العام_من_لوحة_تيسير
+APP_BACKEND_PUBLISHABLE_KEY=ضع قيمة المفتاح فقط مثل sb_publishable_... بدون APP_BACKEND_PUBLISHABLE_KEY= وبدون علامات اقتباس
 SERVICE_TOKEN=نفس التوكن المحفوظ في لوحة تيسير
 ```
 

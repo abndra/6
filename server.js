@@ -39,8 +39,9 @@ const {
 } = require("./firestore-writer");
 const { createFirestoreRemoteStore, deleteRemoteSessionById, deleteAllRemoteSessions } = require("./firestore-session-store");
 const { getPerf } = require("./perf-settings-reader");
+const { cleanEnvValue } = require("./env");
 
-const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "";
+const SERVICE_TOKEN = cleanEnvValue("SERVICE_TOKEN");
 if (!SERVICE_TOKEN) {
   console.error("SERVICE_TOKEN is required. أضفه في Railway بنفس قيمة railwayApiKey في لوحة تيسير.");
 }

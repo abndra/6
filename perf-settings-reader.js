@@ -3,14 +3,9 @@
 // يعطي القيم الفعّالة لخادم واتساب وعامل الذكاء بدون إعادة نشر.
 // ============================================================
 const fetch = require("node-fetch");
+const { readSupabaseConfig, cleanEnvValue } = require("./env");
 
-const SUPABASE_URL = (process.env.APP_SUPABASE_URL || process.env.SUPABASE_URL || "").replace(/\/+$/, "");
-const SUPABASE_KEY =
-  process.env.APP_SUPABASE_PUBLISHABLE_KEY ||
-  process.env.SUPABASE_PUBLISHABLE_KEY ||
-  process.env.APP_SUPABASE_SECRET_KEY ||
-  process.env.SUPABASE_SERVICE_ROLE_KEY ||
-  "";
+const { url: SUPABASE_URL, key: SUPABASE_KEY } = readSupabaseConfig();
 
 const DEFAULTS = {
   AI_POLL_INTERVAL_MS: 15000,
@@ -38,8 +33,11 @@ async function refresh() {
   lastFetchAt = now;
   try {
     const url = `${SUPABASE_URL}/rest/v1/documents?path=eq.runtime/perfSettings&select=data`;
+    const headers = { apikey: SUPABASE_KEY, Accept: "application/json" };
+    const serviceToken = cleanEnvValue("SERVICE_TOKEN");
+    if (serviceToken) headers["x-service-token"] = serviceToken;
     const res = await fetch(url, {
-      headers: { apikey: SUPABASE_KEY, Accept: "application/json" },
+      headers,
     });
     if (!res.ok) return cached;
     const rows = await res.json();

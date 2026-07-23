@@ -11,19 +11,9 @@
 
 const { createClient } = require("@supabase/supabase-js");
 const WebSocket = require("ws");
+const { readSupabaseConfig, createSupabaseFetch, looksLikeSupabaseKey } = require("./env");
 
-const SUPABASE_URL =
-  process.env.APP_BACKEND_URL ||
-  process.env.APP_SUPABASE_URL ||
-  process.env.SUPABASE_URL;
-const SUPABASE_KEY =
-  process.env.APP_BACKEND_PUBLISHABLE_KEY ||
-  process.env.APP_SUPABASE_PUBLISHABLE_KEY ||
-  process.env.SUPABASE_PUBLISHABLE_KEY ||
-  process.env.SUPABASE_ANON_KEY ||
-  process.env.APP_SUPABASE_SECRET_KEY ||
-  process.env.SUPABASE_SERVICE_ROLE_KEY ||
-  process.env.SUPABASE_SECRET_KEY;
+const { url: SUPABASE_URL, key: SUPABASE_KEY, keyName: SUPABASE_KEY_NAME } = readSupabaseConfig();
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "";
 // ملاحظة مهمة: هذه الطبقة لا تستخدم Realtime حقيقي؛ onSnapshot هنا كان polling كل 500ms.
 // هذا سبّب استهلاك egress عالي جداً على Railway/Supabase حتى بدون رسائل.
@@ -37,27 +27,18 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
   );
 }
 
+if (!looksLikeSupabaseKey(SUPABASE_KEY)) {
+  throw new Error(
+    `${SUPABASE_KEY_NAME || "Supabase key"} invalid format. ضع قيمة المفتاح فقط مثل sb_publishable_... وليس السطر كاملاً KEY=value.`,
+  );
+}
+
 if (!SERVICE_TOKEN) {
   console.error("SERVICE_TOKEN missing: ضعه في Railway بنفس القيمة المحفوظة داخل إعدادات البوت");
 }
 
-function makeFetch(key) {
-  return (input, init) => {
-    const headers = new Headers((init && init.headers) || undefined);
-    if (
-      (key.startsWith("sb_publishable_") || key.startsWith("sb_secret_")) &&
-      headers.get("Authorization") === `Bearer ${key}`
-    ) {
-      headers.delete("Authorization");
-    }
-    headers.set("apikey", key);
-    if (SERVICE_TOKEN) headers.set("x-service-token", SERVICE_TOKEN);
-    return fetch(input, { ...init, headers });
-  };
-}
-
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
-  global: { fetch: makeFetch(SUPABASE_KEY) },
+  global: { fetch: createSupabaseFetch(SUPABASE_KEY) },
   auth: { persistSession: false, autoRefreshToken: false },
   // Railway may run on Node versions without a built-in WebSocket implementation.
   // Passing an explicit transport prevents Supabase Realtime from crashing before

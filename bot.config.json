@@ -3,8 +3,8 @@
   "storeId": "ijErPtzCrAksQpnPSqWI",
   "botId": "ck4y0b3GIXqWlJRtNi06",
   "database": "supabase-documents",
-  "filesVersion": "4.5.0",
-  "filesVersionNote": "Runtime perfSettings from Supabase: تحكم بسرعة القراءة/الإرسال من لوحة الأدمين → الإعدادات، بدون إعادة نشر.",
+  "filesVersion": "4.6.0",
+  "filesVersionNote": "Supabase key validation + safe Taysir fallback: يمنع توقف واتساب عند لصق مفتاح Railway خطأ ويعرض السبب الحقيقي في /health واللوجات.",
   "architecture": "whatsapp-bridge + supabase documents aiQueue/outbox + groq ai-worker + supabase remote session",
   "messages": "الرسائل الجديدة فقط بعد الربط — لا استيراد للمحادثات القديمة",
   "endpoints": [

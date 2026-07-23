@@ -48,7 +48,7 @@ const now = () => FieldValue.serverTimestamp();
 
 // تقليل استهلاك قاعدة البيانات: EVENT_LOG_ENABLED والكاش تُقرأ ديناميكياً من perfSettings.
 function isEventLogEnabled() { return getPerf("EVENT_LOG_ENABLED"); }
-function configCacheMs() { return Math.max(0, getPerf("SUPABASE_configCacheMs()")); }
+function configCacheMs() { return Math.max(0, getPerf("SUPABASE_CONFIG_CACHE_MS")); }
 const CONNECTION_STATE_MIN_WRITE_MS = Math.max(1000, Number(process.env.CONNECTION_STATE_MIN_WRITE_MS || 30000));
 let botSecretsCache = { data: null, expiresAt: 0, lastErrorLogAt: 0 };
 let storeConfigCache = { data: null, expiresAt: 0, lastErrorLogAt: 0 };
