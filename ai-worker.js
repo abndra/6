@@ -376,7 +376,7 @@ function mentionedProductsInTextOrder(text) {
 }
 
 function isComplaintText(text) {
-  return /(بلاغ|ابلغ|أبلغ|شكوى|اشتك|سيء|سيئ|سئ|موظف|عامل|اسلوب|أسلوب|وقح|زعلان|مشكله|مشكلة|غلط|تاخير|تأخير|خربان|مو راضي|غير راضي)/i.test(normalize(text));
+  return /(بلاغ|ابلغ|أبلغ|شكوى|اشتك|سيء|سيئ|سئ|موظف|اسلوب|أسلوب|وقح|زعلان|مشكله|مشكلة|غلط|تاخير|تأخير|خربان|مو راضي|غير راضي)/i.test(normalize(text));
 }
 
 function isSuggestionText(text) {
@@ -1270,7 +1270,7 @@ async function extractAndLogSideActivities(phone, userText, botText, history = [
     await logSideActivity("complaints", phone, {
       summary: simpleActivitySummary(userText),
       text: String(userText || "").trim(),
-      category: /موظف|عامل|اسلوب|أسلوب/i.test(normalize(userText)) ? "employee" : "other",
+      category: /موظف|اسلوب|أسلوب/i.test(normalize(userText)) ? "employee" : "other",
       priority: /سيء|سيئ|سئ|وقح|بلاغ|شكوى/i.test(normalize(userText)) ? "high" : "medium",
       urgent: /بلاغ|شكوى|سيء|سيئ|سئ|وقح/i.test(normalize(userText)),
     }, simpleActivitySummary(userText));

@@ -51,6 +51,16 @@ const NEW_MESSAGE_GRACE_SEC = Number(process.env.NEW_MESSAGE_GRACE_SEC || 45);
 const REMOTE_SESSION_BACKUP_MS = Math.max(60000, Number(process.env.REMOTE_SESSION_BACKUP_MS || 300000));
 const REMOTE_SESSION_CLIENT_ID = String(process.env.REMOTE_SESSION_CLIENT_ID || `${STORE_ID}_${BOT_ID}`).replace(/[^a-z0-9_-]/gi, "_");
 const OUTBOX_POLL_INTERVAL_MS = Math.max(250, Number(process.env.OUTBOX_POLL_INTERVAL_MS || 500));
+// إرسال واتساب يجب أن يكون متسلسلاً. الإرسال المتوازي عبر WhatsApp Web يعلّق
+// أحياناً بعد أول رسالتين ويظهر في Railway كـ sendText timeout.
+const OUTBOX_SEND_TIMEOUT_MS = Math.max(30000, Number(process.env.OUTBOX_SEND_TIMEOUT_MS || 60000));
+const OUTBOX_IMAGE_SEND_TIMEOUT_MS = Math.max(45000, Number(process.env.OUTBOX_IMAGE_SEND_TIMEOUT_MS || 90000));
+const OUTBOX_SEND_GAP_MS = Math.max(0, Number(process.env.OUTBOX_SEND_GAP_MS || 1200));
+const OUTBOX_MAX_RETRIES = Math.max(1, Number(process.env.OUTBOX_MAX_RETRIES || 5));
+const OUTBOX_RETRY_BASE_MS = Math.max(2000, Number(process.env.OUTBOX_RETRY_BASE_MS || 10000));
+const OUTBOX_RETRY_MAX_MS = Math.max(10000, Number(process.env.OUTBOX_RETRY_MAX_MS || 120000));
+const OUTBOX_ERROR_RECOVERY_MS = Math.max(0, Number(process.env.OUTBOX_ERROR_RECOVERY_MS || 60 * 60 * 1000));
+const OUTBOX_ERROR_RECOVERY_INTERVAL_MS = Math.max(5000, Number(process.env.OUTBOX_ERROR_RECOVERY_INTERVAL_MS || 15000));
 // getChats/fetchMessages يحمّل بيانات كثيرة من واتساب. نجعله شبكة أمان خفيفة فقط، لا فحصاً كل 30 ثانية.
 const MESSAGE_SWEEP_ENABLED = String(process.env.MESSAGE_SWEEP_ENABLED || "false").toLowerCase() === "true";
 const MESSAGE_SWEEP_INTERVAL_MS = Math.max(300000, Number(process.env.MESSAGE_SWEEP_INTERVAL_MS || 600000));
@@ -154,6 +164,8 @@ let savingRemoteSession = false;
 let statusVerifyInFlight = null;
 const recentAutoSends = new Set();
 let lastOutboxHeartbeatAt = 0;
+let lastOutboxErrorRecoveryAt = 0;
+let consecutiveSendFailures = 0;
 // وقت اكتمال الربط — نتجاهل أي رسالة أقدم منه حتى لا نستورد المحادثات القديمة.
 let readyAtSec = 0;
 
@@ -454,11 +466,35 @@ client.initialize().catch(async (error) => {
 const sending = new Set(); // منع الإرسال المزدوج لنفس الوثيقة
 let unsubscribeOutbox = null;
 let outboxListenerRetryTimer = null;
+let sendQueue = Promise.resolve();
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableSendError(error) {
+  const message = errorMessage(error);
+  return /timeout|Protocol error|Target closed|Session closed|Execution context was destroyed|Navigation failed|not connected|disconnected/i.test(message);
+}
+
+function retryDelayFor(count) {
+  return Math.min(OUTBOX_RETRY_MAX_MS, OUTBOX_RETRY_BASE_MS * Math.pow(2, Math.max(0, count - 1)));
+}
 
 function startOutboxDoc(doc) {
   if (!doc?.id || sending.has(doc.id)) return false;
   sending.add(doc.id);
-  sendOne(doc).finally(() => sending.delete(doc.id));
+  const job = sendQueue
+    .catch(() => {})
+    .then(async () => {
+      try {
+        await sendOne(doc);
+      } finally {
+        if (OUTBOX_SEND_GAP_MS) await delay(OUTBOX_SEND_GAP_MS);
+        sending.delete(doc.id);
+      }
+    });
+  sendQueue = job.catch(() => {});
   return true;
 }
 
@@ -490,10 +526,40 @@ async function drainPendingOutbox(reason = "poll") {
   if (connectionState !== "connected") return;
   const pend = await botRef().collection("outbox").where("status", "==", "pending").limit(10).get();
   pend.forEach((d) => startOutboxDoc(d));
+  await recoverRecentTimedOutOutbox();
   const t = Date.now();
   if (t - lastOutboxHeartbeatAt >= OUTBOX_HEARTBEAT_WRITE_MS) {
     lastOutboxHeartbeatAt = t;
     await setConnectionState({ outboxHeartbeatAt: admin.firestore.FieldValue.serverTimestamp(), outboxPendingSeen: pend.size, outboxLastDrainReason: reason });
+  }
+}
+
+async function recoverRecentTimedOutOutbox() {
+  const t = Date.now();
+  if (!OUTBOX_ERROR_RECOVERY_MS || t - lastOutboxErrorRecoveryAt < OUTBOX_ERROR_RECOVERY_INTERVAL_MS) return;
+  lastOutboxErrorRecoveryAt = t;
+  try {
+    const snap = await botRef().collection("outbox").where("status", "==", "error").limit(10).get();
+    snap.forEach((doc) => {
+      const data = doc.data() || {};
+      const msg = String(data.error || data.lastError || "");
+      if (!/timeout/i.test(msg)) return;
+      const at = Date.parse(data.erroredAt || data.createdAt || "") || t;
+      if (t - at > OUTBOX_ERROR_RECOVERY_MS) return;
+      doc.ref
+        .set(
+          {
+            status: "pending",
+            recoveredFromTimeout: true,
+            nextAttemptAt: t + OUTBOX_RETRY_BASE_MS,
+            lastError: msg.slice(0, 300),
+          },
+          { merge: true },
+        )
+        .catch(() => {});
+    });
+  } catch (e) {
+    console.error("outbox timeout recovery error:", e.message);
   }
 }
 
@@ -542,6 +608,8 @@ function withTimeout(promise, ms, label) {
 async function sendOne(doc) {
   const data = doc.data() || {};
   const { phone, chatId, text, convMsgId, mediaUrl, type, caption } = data;
+  const nextAttemptAt = Number(data.nextAttemptAt || 0);
+  if (nextAttemptAt && Date.now() < nextAttemptAt) return;
   if (!phone || (!text && !mediaUrl)) {
     await markOutboxError(doc.id, "missing phone/text");
     return;
@@ -551,6 +619,8 @@ async function sendOne(doc) {
     return;
   }
   try {
+    const live = await verifyConnectionState({ persist: true });
+    if (live.connected === false) return;
     const autoKey = `${phone}:${text || mediaUrl}`;
     recentAutoSends.add(autoKey);
     setTimeout(() => recentAutoSends.delete(autoKey), 30000).unref?.();
@@ -564,24 +634,47 @@ async function sendOne(doc) {
         const media = await loadImageMedia(mediaUrl);
         await withTimeout(
           client.sendMessage(destination, media, { caption: cap }),
-          30000,
+          OUTBOX_IMAGE_SEND_TIMEOUT_MS,
           "sendImage",
         );
       } catch (imgErr) {
         // فشل إرسال الصورة يجب ألا يقطع المحادثة — أرسل التعليق كنص بديل
         console.error("image send failed, falling back to text:", imgErr.message);
         await logEvent("image_send_fallback", { phone, message: imgErr.message }).catch(() => {});
-        if (cap) await withTimeout(client.sendMessage(destination, cap), 20000, "sendText");
+        if (cap) await withTimeout(client.sendMessage(destination, cap), OUTBOX_SEND_TIMEOUT_MS, "sendText");
       }
     } else {
-      await withTimeout(client.sendMessage(destination, text), 20000, "sendText");
+      await withTimeout(client.sendMessage(destination, text), OUTBOX_SEND_TIMEOUT_MS, "sendText");
     }
     await markOutboxSent(doc.id, phone, convMsgId);
+    consecutiveSendFailures = 0;
     console.log(`→ أُرسلت ${mediaUrl ? "صورة" : "رسالة"} إلى ${phone}`);
   } catch (e) {
-    console.error("send failed:", e.message);
-    await markOutboxError(doc.id, e.message);
-    await logEvent("send_error", { phone, message: e.message });
+    consecutiveSendFailures += 1;
+    const retryable = isRetryableSendError(e);
+    const retryCount = Math.max(0, Number(data.retryCount || 0)) + 1;
+    const message = errorMessage(e);
+    console.error("send failed:", message);
+    if (retryable && retryCount <= OUTBOX_MAX_RETRIES) {
+      const waitMs = retryDelayFor(retryCount);
+      await doc.ref.set(
+        {
+          status: "pending",
+          retryCount,
+          lastError: message,
+          nextAttemptAt: Date.now() + waitMs,
+          erroredAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+      if (/timeout/i.test(message) || consecutiveSendFailures >= 2) {
+        setTimeout(() => requestRestart(`whatsapp send stalled: ${message}`), 300).unref?.();
+      }
+    } else {
+      await markOutboxError(doc.id, message);
+      if (consecutiveSendFailures >= 3) setTimeout(() => requestRestart("repeated whatsapp send failures"), 300).unref?.();
+    }
+    await logEvent("send_error", { phone, message });
   }
 }
 
