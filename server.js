@@ -40,6 +40,7 @@ const {
 const { deleteRemoteSessionById, deleteAllRemoteSessions } = require("./firestore-session-store");
 const { getPerf } = require("./perf-settings-reader");
 const { cleanEnvValue } = require("./env");
+const runtimeBus = require("./runtime-bus");
 
 const SERVICE_TOKEN = cleanEnvValue("SERVICE_TOKEN");
 if (!SERVICE_TOKEN) {
@@ -54,7 +55,14 @@ const MESSAGE_SWEEP_LIMIT = Math.max(3, Math.min(10, Number(process.env.MESSAGE_
 const WA_STATE_TIMEOUT_MS = Math.max(3000, Number(process.env.WA_STATE_TIMEOUT_MS || 7000));
 const STARTED_AT_MS = Date.now();
 const OUTBOX_ACCEPT_AFTER_MS = STARTED_AT_MS - Math.max(0, Number(process.env.OUTBOX_STARTUP_GRACE_MS || 15000));
+const FAST_QUEUE_MODE = String(process.env.FAST_QUEUE_MODE || "true").toLowerCase() !== "false";
 let shutdownRequested = false;
+
+function queueDelay(key, fallback) {
+  const configured = Number(getPerf(key, fallback)) || fallback;
+  if (!FAST_QUEUE_MODE) return Math.max(3000, configured);
+  return Math.max(250, Math.min(configured, fallback));
+}
 
 // ---- عميل واتساب ----
 // الاسم الذي يظهر في «الأجهزة المرتبطة» = navigator.platform (النظام) + متصفح مستخرَج من UA.
@@ -440,6 +448,18 @@ function startOutboxDoc(doc) {
   return true;
 }
 
+runtimeBus.on("outboxPending", (id) => {
+  if (!id) return;
+  setTimeout(async () => {
+    try {
+      const doc = await botRef().collection("outbox").doc(id).get();
+      if (doc?.exists) startOutboxDoc(doc);
+    } catch (e) {
+      console.error("outbox immediate signal failed:", e.message);
+    }
+  }, 0).unref?.();
+});
+
 function attachOutboxListener() {
   if (!getPerf("SNAPSHOT_LISTENERS_ENABLED")) return;
   try {
@@ -483,7 +503,7 @@ async function drainPendingOutbox(reason = "poll") {
 attachOutboxListener();
 
 function scheduleOutboxDrain() {
-  const delay = Math.max(3000, getPerf("OUTBOX_POLL_INTERVAL_MS"));
+  const delay = queueDelay("OUTBOX_POLL_INTERVAL_MS", 500);
   setTimeout(() => {
     drainPendingOutbox("interval").catch((e) => console.error("outbox drain error:", e.message));
     scheduleOutboxDrain();

@@ -15,6 +15,7 @@
 const { admin, getFirestore, FieldValue } = require("./firestore-compat");
 const crypto = require("crypto");
 const { getPerf } = require("./perf-settings-reader");
+const runtimeBus = require("./runtime-bus");
 
 if (!admin.apps.length) admin.initializeApp();
 
@@ -202,6 +203,8 @@ async function saveIncomingMessage(msg) {
     throw e;
   }
 
+  const aiQueueRef = botRef().collection("aiQueue").doc(messageDocId);
+
   await Promise.all([
     convRef.set(
       {
@@ -224,7 +227,7 @@ async function saveIncomingMessage(msg) {
       timestamp: now(),
     }),
     botRef().set({ messagesCount: FieldValue.increment(1), lastMessageAt: now() }, { merge: true }),
-    botRef().collection("aiQueue").doc(messageDocId).set({
+    aiQueueRef.set({
       phone,
       chatId,
       name,
@@ -234,6 +237,8 @@ async function saveIncomingMessage(msg) {
       createdAt: now(),
     }),
   ]);
+
+  runtimeBus.emit("aiQueuePending", messageDocId);
 
   // سجّل قيداً في سجل استهلاك التوكن — قراءة رسالة عميل
   appendTokenLedger({
@@ -301,6 +306,7 @@ async function queueAiReply(phone, text, { source = "ai", chatId = null } = {}) 
 
 async function queueOutgoingMessage(phone, text, { source = "api", chatId = null } = {}) {
   const convRef = botRef().collection("conversations").doc(phone);
+  const outboxRef = botRef().collection("outbox").doc();
 
   // 4.a) الرسالة الصادرة داخل المحادثة (تظهر فوراً في اللوحة)
   const msgDoc = await convRef.collection("messages").add({
@@ -317,7 +323,7 @@ async function queueOutgoingMessage(phone, text, { source = "api", chatId = null
   await Promise.all([
     convRef.set({ lastMessage: text, updatedAt: now(), ...(chatId ? { chatId } : {}) }, { merge: true }),
     // 4.b) طابور الإرسال — خادم واتساب يستمع لهذه المجموعة ويرسل فوراً
-    botRef().collection("outbox").add({
+    outboxRef.set({
       phone,
       chatId,
       text,
@@ -327,6 +333,8 @@ async function queueOutgoingMessage(phone, text, { source = "api", chatId = null
       source,
     }),
   ]);
+
+  runtimeBus.emit("outboxPending", outboxRef.id);
 
   // سجّل قيد استهلاك — إرسال رد
   appendTokenLedger({

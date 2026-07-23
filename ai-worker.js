@@ -35,24 +35,33 @@ const {
   runPoolGroqAutoRenewal,
 } = require("./firestore-writer");
 const { getPerf } = require("./perf-settings-reader");
+const runtimeBus = require("./runtime-bus");
 
 const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 const STALE_PROCESSING_MS = Number(process.env.AI_STALE_PROCESSING_MS || 120000);
 const AI_RECOVER_INTERVAL_MS = Math.max(60000, Number(process.env.AI_RECOVER_INTERVAL_MS || 300000));
-const AI_GROQ_TIMEOUT_MS = Math.max(4000, Number(process.env.AI_GROQ_TIMEOUT_MS || 15000));
-const AI_MAX_CONCURRENT = Math.max(1, Math.min(3, Number(process.env.AI_MAX_CONCURRENT || 1)));
+const AI_GROQ_TIMEOUT_MS = Math.max(4000, Number(process.env.AI_GROQ_TIMEOUT_MS || 9000));
+const AI_MAX_CONCURRENT = Math.max(1, Math.min(3, Number(process.env.AI_MAX_CONCURRENT || 2)));
 const DEFAULT_CLOSED_MESSAGE = "نعتذر، المتجر مغلق حالياً. سنعود إليك عند الفتح.";
 const GROQ_FAST_MODEL = process.env.GROQ_FAST_MODEL || "llama-3.3-70b-versatile";
 const AI_HISTORY_LIMIT = Math.max(6, Math.min(20, Number(process.env.AI_HISTORY_LIMIT || 12)));
 const AI_PROMPT_KNOWLEDGE_LIMIT = Math.max(0, Math.min(8, Number(process.env.AI_PROMPT_KNOWLEDGE_LIMIT || 3)));
 const AI_PROMPT_PRODUCT_LIMIT = Math.max(0, Math.min(30, Number(process.env.AI_PROMPT_PRODUCT_LIMIT || 12)));
 const AI_PROMPT_TEXT_LIMIT = Math.max(80, Number(process.env.AI_PROMPT_TEXT_LIMIT || 600));
-const AI_RESPONSE_CACHE_MS = Math.max(0, Number(process.env.AI_RESPONSE_CACHE_MS || 5 * 60 * 1000));
+const AI_RESPONSE_CACHE_MS = Math.max(0, Number(process.env.AI_RESPONSE_CACHE_MS || 0));
 const AI_MAX_MESSAGE_CHARS = Math.max(200, Number(process.env.AI_MAX_MESSAGE_CHARS || 1200));
 const WORKER_STARTED_AT_MS = Date.now();
 const AI_QUEUE_ACCEPT_AFTER_MS = WORKER_STARTED_AT_MS - Math.max(0, Number(process.env.AI_QUEUE_STARTUP_GRACE_MS || 15000));
+const AI_BURST_WAIT_MS = Math.max(0, Math.min(1200, Number(process.env.AI_BURST_WAIT_MS || 0)));
+const FAST_QUEUE_MODE = String(process.env.FAST_QUEUE_MODE || "true").toLowerCase() !== "false";
 
 const responseCache = new Map();
+
+function queueDelay(key, fallback) {
+  const configured = Number(getPerf(key, fallback)) || fallback;
+  if (!FAST_QUEUE_MODE) return Math.max(3000, configured);
+  return Math.max(250, Math.min(configured, fallback));
+}
 
 // ============================================================
 // 🛡️  البرومبت الأساسي الافتراضي لجميع بوتات تيسير (لا يُكشف أبداً)
@@ -120,6 +129,8 @@ let botConfig = {
 };
 let lastAiHeartbeatAt = 0;
 let lastConfigLog = { key: "", at: 0 };
+let lastConfigRefreshAt = 0;
+let messageConfigRefreshInFlight = null;
 
 function asArray(value) {
   return Array.isArray(value) ? value.filter(Boolean) : [];
@@ -293,6 +304,7 @@ async function refreshConfigFromSupabase(reason = "interval") {
   try {
     const botSnap = await botRef().get();
     await refreshConfig(botSnap.exists ? botSnap.data() : {}, { force: reason === "message" || reason === "config-listener" });
+    lastConfigRefreshAt = Date.now();
   } catch (e) {
     console.error(`config refresh failed (${reason}):`, e.message);
     // لا نفرّغ الإعدادات عند نفاد الكوتا؛ نكمل بآخر إعداد محفوظ في الذاكرة.
@@ -300,7 +312,16 @@ async function refreshConfigFromSupabase(reason = "interval") {
 }
 
 // مهم: لا نستخدم مراقبة مباشرة على وثيقة البوت لأنها تتغير مع كل health/status heartbeat.
-refreshConfigFromSupabase("startup").catch(() => {});
+let configLoaded = false;
+let configReadyPromise = refreshConfigFromSupabase("startup").finally(() => { configLoaded = true; });
+
+function refreshConfigForMessageInBackground() {
+  const minGap = Math.max(3000, Math.min(15000, Number(getPerf("AI_CONFIG_REFRESH_MS")) || 10000));
+  if (messageConfigRefreshInFlight || Date.now() - lastConfigRefreshAt < minGap) return;
+  messageConfigRefreshInFlight = refreshConfigFromSupabase("message-background")
+    .catch(() => {})
+    .finally(() => { messageConfigRefreshInFlight = null; });
+}
 function scheduleConfigRefresh() {
   const delay = Math.max(60000, getPerf("AI_CONFIG_REFRESH_MS"));
   setTimeout(() => {
@@ -426,6 +447,14 @@ function instantMatch(text) {
     return "شكراً على اقتراحك، بسجله للإدارة الآن حتى تتم مراجعته وتحسين الخدمة.";
   }
 
+  if (/(^|\s)(مين|من)\s+(انت|انتي|أنت|أنتي|حضرتك)(\s|$)|عرف\s*نفسك|شو\s+انت/i.test(t)) {
+    return `أنا ${botConfig.botName || "المساعد"}، مساعد ذكي تابع لمتجر ${botConfig.storeName || "المتجر"}. أقدر أساعدك بالمنتجات والأسعار والطلبات.`;
+  }
+
+  if (/(اسم\s*(المتجر|المحل|الشركه|الشركة)|شو\s+اسم\s*(المتجر|المحل)|ايش\s+اسم\s*(المتجر|المحل)|وش\s+اسم\s*(المتجر|المحل))/i.test(t)) {
+    return `اسم المتجر: ${botConfig.storeName || "المتجر"}.`;
+  }
+
   // 🛒 فحص توفّر صارم: عند سؤال العميل "هل عندكم X / في عندكم X / عندكم X؟"
   // نجيب حرفياً من المخزون، ولا نترك النموذج يخترع فئات غير موجودة.
   const availabilityMatch = t.match(
@@ -456,6 +485,16 @@ function instantMatch(text) {
       return `• ${name}${price}`;
     });
     return `نعم متوفر:\n${lines.join("\n")}\nأي واحد تحب؟`;
+  }
+
+  if (/(شو|ايش|وش|ماذا|ما)\s*(بتبيع|تبيع|عندكم|متوفر|متوفرين)|\b(منتجات|منتجاتكم|المنتجات|منيو|المنيو|قائمه|قائمة|اسعار|الاسعار|أسعار|الأسعار)\b|كم\s*(السعر|الاسعار|الأسعار)/i.test(t)) {
+    return formatProductsList();
+  }
+
+  if (/^(السلام\s+عليكم|مرحبا|مراحب|هلا|اهلا|أهلا|هاي|كيفك|كيف\s+الحال|شلونك|صباح\s+الخير|مساء\s+الخير)/i.test(t)) {
+    return t.includes("السلام")
+      ? `وعليكم السلام ورحمة الله وبركاته، أهلاً بك في ${botConfig.storeName || "المتجر"}. كيف أقدر أساعدك؟`
+      : `أهلاً بك في ${botConfig.storeName || "المتجر"}. كيف أقدر أساعدك؟`;
   }
 
   const imageIntent = /(صوره|صورة|صور|اشوف|شوف|ارسل|اعرض)/i.test(t);
@@ -504,6 +543,21 @@ function tokenScore(a, b) {
   return bw.filter((w) => aw.has(w) || [...aw].some((x) => x.includes(w) || w.includes(x))).length / bw.length;
 }
 
+function formatProductLine(p) {
+  const name = textValue(p?.name, p?.title, "منتج");
+  const price = p?.price != null && p.price !== "" ? ` — ${p.price}` : "";
+  const desc = p?.description ? ` — ${clampText(p.description, 90)}` : "";
+  return `• ${name}${price}${desc}`;
+}
+
+function formatProductsList(limit = 12) {
+  const products = asArray(botConfig.products).filter((p) => textValue(p?.name, p?.title));
+  if (!products.length) return "حالياً لا توجد منتجات مضافة في لوحة المتجر.";
+  const lines = products.slice(0, limit).map(formatProductLine);
+  const more = products.length > limit ? `\nويوجد ${products.length - limit} منتج آخر — اسألني عن اسم المنتج لأعطيك سعره وتفاصيله.` : "";
+  return `المتوفر حالياً في ${botConfig.storeName || "المتجر"}:\n${lines.join("\n")}${more}`;
+}
+
 function clampText(value, limit = AI_PROMPT_TEXT_LIMIT) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (!text || text.length <= limit) return text;
@@ -549,9 +603,7 @@ function fallbackReplyFor(userMessage) {
   }).filter(Boolean);
 
   if (/(شو|ايش|وش|ماذا|ما)\s*(عندكم|متوفر|متوفرين)|منتجات|المنيو|منيو|اسعار|أسعار|قائمة/i.test(text)) {
-    return productLines.length
-      ? `المتوفر حالياً:\n${productLines.join("\n")}`
-      : "لم يتم إضافة منتجات في المخزون حالياً، تواصل معنا بعد قليل.";
+    return formatProductsList();
   }
 
   const matchedProduct = products.find((p) => {
@@ -1441,12 +1493,13 @@ async function extractAndApplyOrderChange(phone, userText, botText, history = []
 // ============================================================
 
 async function processJob(phone, body, msgId, chatId = null) {
-  // إطلاق تحديث الإعدادات وتحميل السياق بالتوازي منذ اللحظة الأولى — أقصى سرعة ممكنة
-  const configPromise = refreshConfigFromSupabase("message").catch(() => {});
+  // لا نوقف الرد بانتظار قراءة الإعدادات كل رسالة؛ نستخدم آخر تدريب محفوظ في الذاكرة
+  // ونحدّثه بالخلفية. عند أول تشغيل فقط ننتظر أول تحميل حتى لا يرد البوت بدون تدريب.
+  if (configLoaded) refreshConfigForMessageInBackground();
   const historyPromise = loadHistory(phone).catch(() => []);
   const text = (body || "").trim();
   if (!text) return;
-  await configPromise;
+  if (!configLoaded) await configReadyPromise.catch(() => {});
 
   // 1) المتجر/البوت مغلق أو خارج ساعات العمل — أعلى أولوية دائماً ولا يتجاوزها أي ذكاء/تحويل.
   // 0) الوكيل موقوف يدوياً من زر ON/OFF في لوحة التحكم — تجاهل الرسالة بصمت
@@ -1531,10 +1584,6 @@ async function processJob(phone, body, msgId, chatId = null) {
   } catch (e) {
     console.error("Groq failed:", e.message);
     await logEvent("groq_error", { phone, message: e.message });
-    if (/GROQ_API_KEY missing/i.test(String(e.message || ""))) {
-      await markIncomingAiError(phone, msgId, e.message);
-      return;
-    }
     const fallback = fallbackReplyFor(text);
     if (shouldSendFallbackNow(phone)) {
       await queueAiReply(phone, fallback, { source: /429|rate/i.test(String(e.message || "")) ? "rate-limit-fallback" : "fallback", chatId });
@@ -1553,6 +1602,7 @@ async function processJob(phone, body, msgId, chatId = null) {
 // الاستماع لطابور الذكاء — onSnapshot للسرعة + polling دائم كشبكة أمان
 // ============================================================
 const processing = new Set();
+const processingPhones = new Set();
 let unsubscribeAiQueue = null;
 let aiListenerRetryTimer = null;
 let aiListenerRetryDelayMs = 30000;
@@ -1564,10 +1614,28 @@ function canStartMoreJobs() {
 
 function startQueueDoc(doc) {
   if (!doc?.id || processing.has(doc.id) || !canStartMoreJobs()) return false;
+  const phone = String(doc.data()?.phone || "").trim();
+  if (phone && processingPhones.has(phone)) return false;
   processing.add(doc.id);
-  handleQueueDoc(doc).finally(() => processing.delete(doc.id));
+  if (phone) processingPhones.add(phone);
+  handleQueueDoc(doc).finally(() => {
+    processing.delete(doc.id);
+    if (phone) processingPhones.delete(phone);
+  });
   return true;
 }
+
+runtimeBus.on("aiQueuePending", (id) => {
+  if (!id) return;
+  setTimeout(async () => {
+    try {
+      const doc = await botRef().collection("aiQueue").doc(id).get();
+      if (doc?.exists) startQueueDoc(doc);
+    } catch (e) {
+      console.error("ai immediate signal failed:", e.message);
+    }
+  }, 0).unref?.();
+});
 
 function attachAiQueueListener() {
   if (String(process.env.SNAPSHOT_LISTENERS_ENABLED || "false").toLowerCase() !== "true") return;
@@ -1617,7 +1685,7 @@ async function drainPendingJobs(reason = "poll") {
   try {
     await recoverStuckJobs();
     while (canStartMoreJobs()) {
-      const limit = Math.max(1, AI_MAX_CONCURRENT - processing.size);
+      const limit = Math.max(10, AI_MAX_CONCURRENT * 5);
       const pend = await botRef().collection("aiQueue").where("status", "==", "pending").limit(limit).get();
       if (pend.empty) break;
       let started = 0;
@@ -1681,20 +1749,53 @@ async function handleQueueDoc(doc) {
   if (!claimed) return;
 
   const { phone, body, msgId, chatId } = initialData;
+  const burst = await collectPendingBurst(phone, initialData).catch(() => ({ text: body, extras: [] }));
   try {
-    await processJob(phone, body, msgId, chatId || null);
+    await processJob(phone, burst.text || body, msgId, burst.chatId || chatId || null);
     await ref.set({ status: "done", doneAt: new Date() }, { merge: true });
+    await Promise.all((burst.extras || []).map(async (extra) => {
+      await extra.ref.set({ status: "done", doneAt: new Date(), mergedWith: doc.id }, { merge: true }).catch(() => {});
+      if (extra.msgId) await markIncomingAiDone(phone, extra.msgId, { aiResponse: null, aiSource: "merged_with_burst_reply" }).catch(() => {});
+    }));
   } catch (e) {
     console.error("processJob error:", e.message);
     await ref.set({ status: "error", error: String(e.message).slice(0, 300) }, { merge: true }).catch(() => {});
   }
 }
 
+async function collectPendingBurst(phone, currentData = {}) {
+  if (!AI_BURST_WAIT_MS || !phone) return { text: currentData.body || "", extras: [], chatId: currentData.chatId || null };
+  await new Promise((resolve) => setTimeout(resolve, AI_BURST_WAIT_MS).unref?.());
+  const snap = await botRef().collection("aiQueue")
+    .where("status", "==", "pending")
+    .where("phone", "==", phone)
+    .limit(8)
+    .get();
+  const currentMs = timestampToMs(currentData.createdAt) || Date.now();
+  const extras = snap.docs
+    .map((d) => ({ id: d.id, ref: d.ref, data: d.data() || {} }))
+    .filter((x) => x.data.body && !isOlderThanWorkerStart(x.data.createdAt))
+    .filter((x) => {
+      const ms = timestampToMs(x.data.createdAt) || Date.now();
+      return ms >= currentMs - 1000 && ms <= Date.now() + 1000;
+    })
+    .sort((a, b) => (timestampToMs(a.data.createdAt) || 0) - (timestampToMs(b.data.createdAt) || 0))
+    .slice(0, 5);
+  await Promise.all(extras.map((x) => x.ref.set({ status: "processing", claimedAt: FieldValue.serverTimestamp(), mergedWith: currentData.msgId || "burst" }, { merge: true }).catch(() => {})));
+  const bodies = [currentData.body, ...extras.map((x) => x.data.body)].map((x) => String(x || "").trim()).filter(Boolean);
+  if (bodies.length <= 1) return { text: currentData.body || "", extras: [], chatId: currentData.chatId || null };
+  return {
+    text: `رسائل متتالية من نفس العميل، أجب برد واحد يغطيها كلها واعتمد آخر سؤال:\n${bodies.map((b, i) => `${i + 1}) ${b}`).join("\n")}`,
+    extras: extras.map((x) => ({ ref: x.ref, msgId: x.data.msgId, id: x.id })),
+    chatId: extras[extras.length - 1]?.data?.chatId || currentData.chatId || null,
+  };
+}
+
 console.log("🤖 عامل الذكاء (Groq) يعمل ويستمع لطابور الرسائل...");
 attachAiQueueListener();
 
 function scheduleAiPoll() {
-  const delay = Math.max(3000, getPerf("AI_POLL_INTERVAL_MS"));
+  const delay = queueDelay("AI_POLL_INTERVAL_MS", 800);
   setTimeout(() => {
     drainPendingJobs("interval").catch(() => {});
     scheduleAiPoll();
